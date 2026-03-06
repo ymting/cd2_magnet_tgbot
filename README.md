@@ -37,22 +37,25 @@ services:
       - SAVE_PATH=/115/离线下载              # 下载保存的根目录
       - ADMIN_IDS=1234567,8901234            # 管理员数字 ID，多个用逗号隔开
       - SIZE_THRESHOLD=300                   # 判定垃圾任务的体积阈值 (MB)
-      - PROXY_URL=[http://192.168.31.10:7890](http://192.168.31.10:7890)  # 可选：访问 Telegram 的代理地址
+      - PROXY_URL=http://192.168.31.10:7890  # 可选：访问 Telegram 的代理地址
+      - CLEAN_CRON=30 3 * * *
 
 ```
 ---
 
 ## 📖 环境变量详细说明
 
-| 变量名 | 必填 | 默认值 | 描述 |
-| :--- | :--- | :--- | :--- |
-| CD2_ADDRESS | 是 | 127.0.0.1:19798 | CloudDrive2 的 IP 和 gRPC 端口 |
-| CD2_TOKEN | 是 | - | CloudDrive2 API 的 Access Token |
-| TG_TOKEN | 是 | - | Telegram Bot 的 API Token |
-| ADMIN_IDS | 是 | - | 允许使用机器人的用户数字 ID，逗号分隔 |
-| SAVE_PATH | 否 | /115/离线下载 | 离线下载任务存放的根路径 |
-| SIZE_THRESHOLD | 否 | 300 | 文件夹内最大文件小于此体积(MB)将被删除 |
-| PROXY_URL | 否 | - | 连接 Telegram 的代理，支持 http/socks5 |
+| 变量名            | 必填 | 默认值 | 描述 |
+|:---------------|:---| :--- | :--- |
+| CD2_ADDRESS    | 是  | 127.0.0.1:19798 | CloudDrive2 的 IP 和 gRPC 端口 |
+| CD2_TOKEN      | 是  | - | CloudDrive2 API 的 Access Token |
+| TG_TOKEN       | 是  | - | Telegram Bot 的 API Token |
+| ADMIN_IDS      | 是  | - | 允许使用机器人的用户数字 ID，逗号分隔 |
+| SAVE_PATH      | 否  | /115/离线下载 | 离线下载任务存放的根路径 |
+| SIZE_THRESHOLD | 否  | 300 | 文件夹内最大文件小于此体积(MB)将被删除 |
+| PROXY_URL      | 否  | - | 连接 Telegram 的代理，支持 http/socks5 |
+| CLEAN_CRON     | 否  |  30 3 * * * | 定时清理任务的 Cron 表达式|
+
 
 ---
 
