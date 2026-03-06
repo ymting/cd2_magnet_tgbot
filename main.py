@@ -183,8 +183,8 @@ if __name__ == '__main__':
 
     # 注册处理器
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_link))
-    app.add_handler(CommandHandler("clean", cmd_clean))
-    app.add_handler(CommandHandler("blacklist", cmd_blacklist))
+    app.add_handler(CommandHandler("clean", clean))
+    app.add_handler(CommandHandler("blacklist", blacklist))
 
     # 启动机器人（这会启动事件循环）
     logger.info("🚀 CloudDrive2 Bot 开始运行...")
