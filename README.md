@@ -22,23 +22,23 @@
 
 推荐使用 Docker Compose 进行部署。在您的服务器上创建目录并编写 `docker-compose.yml`：
 
-```yaml
-services:
-  cd2-bot:
-    image: ghcr.io/ymting/cd2_magnet_tgbot:latest
-    container_name: tg_cd2_manager
-    restart: always
-    volumes:
-      - ./blacklist.txt:/app/blacklist.txt  # 持久化黑名单文件
-    environment:
-      - CD2_ADDRESS=192.168.31.224:19798    # CloudDrive2 的 gRPC 地址
-      - CD2_TOKEN=你的_CD2_API_TOKEN         # CD2 设置中获取的 Token
-      - TG_TOKEN=你的_机器人_TOKEN           # 从 @BotFather 获取的 Token
-      - SAVE_PATH=/115/离线下载              # 下载保存的根目录
-      - ADMIN_IDS=1234567,8901234            # 管理员数字 ID，多个用逗号隔开
-      - SIZE_THRESHOLD=300                   # 判定垃圾任务的体积阈值 (MB)
-      - PROXY_URL=[http://192.168.31.10:7890](http://192.168.31.10:7890)  # 可选：访问 Telegram 的代理地址
-```yaml
+ ```yaml
+ services:
+   cd2-bot:
+     image: ghcr.io/ymting/cd2_magnet_tgbot:latest
+     container_name: tg_cd2_manager
+     restart: always
+     volumes:
+       - ./blacklist.txt:/app/blacklist.txt  # 持久化黑名单文件
+     environment:
+       - CD2_ADDRESS=192.168.31.224:19798    # CloudDrive2 的 gRPC 地址
+       - CD2_TOKEN=你的_CD2_API_TOKEN         # CD2 设置中获取的 Token
+       - TG_TOKEN=你的_机器人_TOKEN           # 从 @BotFather 获取的 Token
+       - SAVE_PATH=/115/离线下载              # 下载保存的根目录
+       - ADMIN_IDS=1234567,8901234            # 管理员数字 ID，多个用逗号隔开
+       - SIZE_THRESHOLD=300                   # 判定垃圾任务的体积阈值 (MB)
+       - PROXY_URL=[http://192.168.31.10:7890](http://192.168.31.10:7890)  # 可选：访问 Telegram 的代理地址
+
 ---
 
 ## 📖 环境变量详细说明
