@@ -21,7 +21,7 @@
 ## 🛠️ 部署指南 (Docker Compose)
 
 在您的服务器上创建目录并编写 docker-compose.yml：
-
+```yaml
 services:
   cd2-bot:
     image: ghcr.io/你的用户名/你的仓库名:latest
@@ -38,6 +38,7 @@ services:
       - SIZE_THRESHOLD=300
       - PROXY_URL=http://192.168.31.10:7890
 
+```
 ---
 
 ## 📖 环境变量详细说明
