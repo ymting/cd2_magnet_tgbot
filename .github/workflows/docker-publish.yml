@@ -2,16 +2,15 @@ name: Docker Build and Publish
 
 on:
   push:
-    branches: [ "main" ]  # 监听 main 分支的推送
-  workflow_dispatch:      # 允许你在 GitHub 页面上手动点击运行
+    branches: [ "main" ]
+  workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io
-  # 镜像名称通常是：用户名/仓库名
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  build-and-push:
+  build:
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -33,7 +32,4 @@ jobs:
         with:
           context: .
           push: true
-          # 生成两个标签：latest 和 对应的 Git 提交号
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest

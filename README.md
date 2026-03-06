@@ -1,28 +1,23 @@
-# CloudDrive2 Telegram Manager
+# CloudDrive2 Telegram 下载管理器
 
 
 
-这是一个专为 **CloudDrive2 (CD2)** 离线下载开发的 Telegram 机器人助手。它能帮你通过手机随时随地提交下载任务，并根据规则自动清理下载目录中的垃圾文件和无效文件夹。
+这是一个专为 **CloudDrive2 (CD2)** 开发的 Telegram 机器人助手。它能够接收磁力链接、HTTP 链接及 ed2k 链接，并自动提交至 CD2 执行离线下载，同时提供强大的自动化后期清理功能。
 
-## 🌟 核心功能
+## ✨ 功能特性
 
-- **远程离线下载**：发送磁力链接 (`magnet:?`) 或 HTTP 链接，直接推送到 CD2 离线任务。
-- **自动菜单注册**：启动即自动同步 Telegram `/` 指令菜单，无需手动配置。
-- **智能黑名单清理**：
-  - 发送 `/clean` 即可扫描并删除指定的垃圾文件（如 `.url`, `.txt`, 各种广告文件）。
-  - **自动删减**：如果任务文件夹内不含大于 **300MB** 的文件（判定为样片或无效任务），机器人会将其连根删除。
-  - **空目录清理**：自动删除离线任务产生的空文件夹。
-- **白名单安全机制**：仅允许设定的 `ADMIN_IDS` 用户使用。
+- **多协议支持**：支持直接发送 `magnet:?xt=`、`http://`、`https://` 以及 `ed2k://` 链接进行离线下载。
+- **智能后期清理**：
+  - **黑名单过滤**：自动删除命中的广告、说明文件（如 `.url`, `.txt`, `扫码` 等）。
+  - **垃圾任务判定**：若任务文件夹内没有文件超过设定阈值（默认 **300MB**），则判定为无效任务并自动整体删除。
+  - **空目录移除**：自动识别并清理离线任务产生的空文件夹。
+- **网络代理支持**：支持 http 和 socks5 代理，解决国内服务器无法连接 Telegram API 的问题。
+- **自动命令菜单**：机器人启动后会自动向 Telegram 注册 `/clean` 和 `/blacklist` 命令菜单。
+- **安全保障**：严格校验 `ADMIN_IDS`，仅限管理员操作；所有清理操作严格锁定在 `SAVE_PATH` 范围内。
 
-## 🚀 部署指南 (Docker)
+## 🛠️ 部署指南 (Docker Compose)
 
-### 1. 准备文件
-确保你的 GitHub 仓库中包含以下核心文件：
-- `main.py`, `clouddrive_pb2.py`, `clouddrive_pb2_grpc.py`
-- `Dockerfile`, `requirements.txt`
-
-### 2. 运行环境配置 (docker-compose.yml)
-推荐使用 `docker-compose` 部署，示例配置如下：
+推荐使用 Docker Compose 进行部署。在您的服务器上创建目录并编写 `docker-compose.yml`：
 
 ```yaml
 services:
@@ -31,11 +26,12 @@ services:
     container_name: tg_cd2_manager
     restart: always
     volumes:
-      - ./blacklist.txt:/app/blacklist.txt
+      - ./blacklist.txt:/app/blacklist.txt  # 持久化黑名单文件
     environment:
-      - CD2_ADDRESS=192.168.x.x:19798       # CD2 的访问地址
-      - CD2_TOKEN=你的_CD2_API_TOKEN        # CD2 设置中获取的 Token
-      - TG_TOKEN=你的_TG_BOT_TOKEN          # 从 @BotFather 获取
-      - SAVE_PATH=/115/离线下载             # 任务保存的根目录
-      - ADMIN_IDS=1234567,8901234           # 允许使用机器人的 TG ID
-      - SIZE_THRESHOLD=300                  # 判定垃圾任务的体积阈值(MB)
+      - CD2_ADDRESS=192.168.31.224:19798    # CloudDrive2 的 gRPC 地址
+      - CD2_TOKEN=你的_CD2_API_TOKEN         # CD2 设置中获取的 Token
+      - TG_TOKEN=你的_机器人_TOKEN           # 从 @BotFather 获取的 Token
+      - SAVE_PATH=/115/离线下载              # 下载保存的根目录
+      - ADMIN_IDS=1234567,8901234            # 管理员数字 ID，多个用逗号隔开
+      - SIZE_THRESHOLD=300                   # 判定垃圾任务的体积阈值 (MB)
+      - PROXY_URL=[http://192.168.31.10:7890](http://192.168.31.10:7890)  # 可选：访问 Telegram 的代理地址
