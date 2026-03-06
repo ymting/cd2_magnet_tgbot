@@ -1,0 +1,17 @@
+services:
+  cd2-manager:
+    # 替换为你自己的仓库地址，例如：ghcr.io/username/repo:latest
+    image: ghcr.io/${GITHUB_USER}/${REPO_NAME}:latest
+    container_name: tg_cd2_bot
+    restart: always
+    volumes:
+      # 映射黑名单文件，确保 NAS 重启后设置不丢失
+      - ./blacklist.txt:/app/blacklist.txt
+    environment:
+      # 这里填入你的真实信息，或者在同级目录下新建 .env 文件
+      - CD2_ADDRESS=192.168.31.224:19798
+      - CD2_TOKEN=你的_CD2_API_TOKEN
+      - TG_TOKEN=你的_TG_BOT_TOKEN
+      - SAVE_PATH=/115/离线下载
+      - ADMIN_IDS=你的数字ID
+      - SIZE_THRESHOLD=300
