@@ -150,27 +150,42 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             await update.message.reply_text(f"❌ 提交失败，网络连接异常: {str(e)}")
 
-
 async def post_init(application):
-    await application.bot.set_my_commands(
-        [BotCommand("clean", "立即执行全量扫描清理"), BotCommand("blacklist", "查看或添加黑名单")])
+    """
+    Bot 启动后的初始化操作
+    """
+    # 1. 注册命令菜单
+    await application.bot.set_my_commands([
+        BotCommand("clean", "立即执行全量扫描清理"),
+        BotCommand("blacklist", "查看或添加黑名单")
+    ])
+
+    # 2. 在这里启动定时调度器，此时事件循环已经运行
+    scheduler = AsyncIOScheduler()
+    try:
+        scheduler.add_job(run_auto_clean, CronTrigger.from_crontab(CLEAN_CRON))
+        scheduler.start()
+        logger.info(f"📅 定时任务已在 post_init 中启动，Cron: [{CLEAN_CRON}]")
+    except Exception as e:
+        logger.error(f"❌ Cron 表达式解析失败: {str(e)}")
 
 
 if __name__ == '__main__':
+    # 构造机器人 Application
     builder = ApplicationBuilder().token(TG_BOT_TOKEN).post_init(post_init)
+
     if PROXY_URL:
+        logger.info(f"检测到代理配置: {PROXY_URL}")
         builder.proxy(PROXY_URL)
         builder.get_updates_proxy(PROXY_URL)
 
     app = builder.build()
 
-    # 开启 Cron 定时调度
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(run_auto_clean, CronTrigger.from_crontab(CLEAN_CRON))
-    scheduler.start()
-
+    # 注册处理器
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_link))
     app.add_handler(CommandHandler("clean", cmd_clean))
+    app.add_handler(CommandHandler("blacklist", cmd_blacklist))
 
-    logger.info("🚀 机器人启动，监听指令中...")
+    # 启动机器人（这会启动事件循环）
+    logger.info("🚀 CloudDrive2 Bot 开始运行...")
     app.run_polling()
