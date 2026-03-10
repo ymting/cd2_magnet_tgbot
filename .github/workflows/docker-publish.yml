@@ -1,4 +1,4 @@
-name: Docker Build and Publish
+name: 构建并推送 Docker 镜像
 
 on:
   push:
@@ -11,23 +11,24 @@ env:
 
 jobs:
   build:
+    name: 构建和上传任务
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
 
     steps:
-      - name: Checkout repository
+      - name: 拉取项目代码 (Checkout repository)
         uses: actions/checkout@v4
 
-      - name: Log in to the Container registry
+      - name: 登录到容器镜像中心 (Log in to the Container registry)
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push Docker image
+      - name: 构建并推送到 Docker Hub / GHCR (Build and push Docker image)
         uses: docker/build-push-action@v5
         with:
           context: .

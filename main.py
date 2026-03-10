@@ -198,10 +198,17 @@ async def post_init(application):
         BotCommand("blacklist", "查看或更新黑名单关键词")
     ])
     # 初始化并启动调度器
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(run_auto_clean, CronTrigger.from_crontab(CLEAN_CRON))
-    scheduler.start()
-    logger.info(f"📅 定时任务系统已启动，Cron 设定: [{CLEAN_CRON}]")
+    # 修复假死问题：不要单独创建 AsyncIOScheduler 实例，否则会引发 asyncio 事件循环冲突
+    # 改为使用 python-telegram-bot 内置的 job_queue，由于自带的 job_queue 可以良好管理协程，避免卡死。
+    if application.job_queue:
+        # job_queue 内部包含了一个配置好的 apscheduler 实例
+        application.job_queue.scheduler.add_job(
+            run_auto_clean, 
+            CronTrigger.from_crontab(CLEAN_CRON)
+        )
+        logger.info(f"📅 定时任务系统已启动(基于内置JobQueue)，Cron 设定: [{CLEAN_CRON}]")
+    else:
+        logger.error("❌ 无法启动定时清理任务：内置的 JobQueue 未初始化。")
 
 
 # ==========================================
