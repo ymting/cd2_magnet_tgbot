@@ -53,7 +53,7 @@ def get_blacklist():
         return [line.strip() for line in f if line.strip()]
 
 
-async def clean_task_folder(stub, metadata, folder_path):
+async def clean_task_folder(stub, metadata, folder_path) -> str | None:
     """
     对单个任务文件夹执行清理动作:
     - 删除匹配关键词的广告文件。
@@ -153,7 +153,7 @@ async def cmd_clean(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """手动清理命令 (/clean)"""
     if update.effective_user.id not in ADMIN_IDS: return
     status_msg = await update.message.reply_text("🔍 正在全量扫描目录，请稍后...")
-    results = []
+    results: list[str] = []
     try:
         async with grpc.aio.insecure_channel(CD2_IP_PORT) as channel:
             stub = clouddrive_pb2_grpc.CloudDriveFileSrvStub(channel)
