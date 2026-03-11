@@ -226,8 +226,8 @@ if __name__ == '__main__':
     
     if PROXY_URL:
         logger.info(f"正在配置网络代理: {PROXY_URL}")
-        # telegram.request.HTTPXRequest 支持直接传入 proxy 参数
-        q_request = HTTPXRequest(proxy_url=PROXY_URL, **request_kwargs)
+        # telegram.request.HTTPXRequest 在 v22+ 支持直接传入 proxy 参数
+        q_request = HTTPXRequest(proxy=PROXY_URL, **request_kwargs)
     else:
         q_request = HTTPXRequest(**request_kwargs)
         
