@@ -19,6 +19,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from telegram import Update, BotCommand
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, filters
+from telegram.request import HTTPXRequest
 
 # ==========================================
 # 1. 变量配置区 (从 Docker 环境变量读取)
@@ -213,11 +214,17 @@ async def post_init(application):
 
 # ==========================================
 # 4. 程序入口
-# ==========================================
-
 if __name__ == '__main__':
-    # 构造应用实例，并注入初始化函数
-    builder = ApplicationBuilder().token(TG_BOT_TOKEN).post_init(post_init)
+    # 构造更健壮的网络请求类，防止由于网络波动抛出 httpx.ConnectError 导致直接崩溃
+    q_request = HTTPXRequest(
+        connection_pool_size=8,
+        read_timeout=30.0,
+        write_timeout=30.0,
+        connect_timeout=20.0,
+        pool_timeout=15.0
+    )
+    # 构造应用实例，并注入初始化函数和网路请求类
+    builder = ApplicationBuilder().token(TG_BOT_TOKEN).post_init(post_init).request(q_request)
 
     # 代理网络配置
     if PROXY_URL:
