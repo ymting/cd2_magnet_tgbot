@@ -228,11 +228,13 @@ if __name__ == '__main__':
         logger.info(f"正在配置网络代理: {PROXY_URL}")
         # telegram.request.HTTPXRequest 在 v22+ 支持直接传入 proxy 参数
         q_request = HTTPXRequest(proxy=PROXY_URL, **request_kwargs)
+        u_request = HTTPXRequest(proxy=PROXY_URL, **request_kwargs)
     else:
         q_request = HTTPXRequest(**request_kwargs)
+        u_request = HTTPXRequest(**request_kwargs)
         
-    # 构造应用实例，并注入初始化函数和网路请求类
-    builder = ApplicationBuilder().token(TG_BOT_TOKEN).post_init(post_init).request(q_request)
+    # 构造应用实例，并同时为 bot 实例和 updater(getUpdates轮询) 注入支持代理的网络请求类
+    builder = ApplicationBuilder().token(TG_BOT_TOKEN).post_init(post_init).request(q_request).get_updates_request(u_request)
 
     app = builder.build()
 
