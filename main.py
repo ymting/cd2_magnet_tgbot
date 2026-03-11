@@ -215,22 +215,24 @@ async def post_init(application):
 # ==========================================
 # 4. 程序入口
 if __name__ == '__main__':
-    # 构造更健壮的网络请求类，防止由于网络波动抛出 httpx.ConnectError 导致直接崩溃
-    q_request = HTTPXRequest(
-        connection_pool_size=8,
-        read_timeout=30.0,
-        write_timeout=30.0,
-        connect_timeout=20.0,
-        pool_timeout=15.0
-    )
-    # 构造应用实例，并注入初始化函数和网路请求类
-    builder = ApplicationBuilder().token(TG_BOT_TOKEN).post_init(post_init).request(q_request)
-
     # 代理网络配置
+    request_kwargs = {
+        "connection_pool_size": 8,
+        "read_timeout": 30.0,
+        "write_timeout": 30.0,
+        "connect_timeout": 20.0,
+        "pool_timeout": 15.0
+    }
+    
     if PROXY_URL:
         logger.info(f"正在配置网络代理: {PROXY_URL}")
-        builder.proxy(PROXY_URL)
-        builder.get_updates_proxy(PROXY_URL)
+        # telegram.request.HTTPXRequest 支持直接传入 proxy 参数
+        q_request = HTTPXRequest(proxy_url=PROXY_URL, **request_kwargs)
+    else:
+        q_request = HTTPXRequest(**request_kwargs)
+        
+    # 构造应用实例，并注入初始化函数和网路请求类
+    builder = ApplicationBuilder().token(TG_BOT_TOKEN).post_init(post_init).request(q_request)
 
     app = builder.build()
 
