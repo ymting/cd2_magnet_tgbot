@@ -14,8 +14,6 @@ import grpc
 import asyncio
 import clouddrive_pb2
 import clouddrive_pb2_grpc
-from datetime import datetime
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from telegram import Update, BotCommand
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, filters
@@ -28,15 +26,56 @@ CD2_IP_PORT = os.getenv("CD2_ADDRESS", "127.0.0.1:19798")  # CD2 的内网 IP �
 CD2_TOKEN = os.getenv("CD2_TOKEN", "")  # CD2 API 授权令牌
 SAVE_PATH = os.getenv("SAVE_PATH", "/115/离线下载")  # 下载存放的根路径
 TG_BOT_TOKEN = os.getenv("TG_TOKEN", "")  # Telegram 机器人 Token
-ADMIN_IDS = [int(i) for i in os.getenv("ADMIN_IDS", "").split(",") if i.strip()]  # 允许操作的用户 ID
 PROXY_URL = os.getenv("PROXY_URL", "")  # 连接 Telegram 的网络代理
 CLEAN_CRON = os.getenv("CLEAN_CRON", "30 3 * * *")  # 定时清理的 Cron 表达式
 BLACKLIST_FILE = "blacklist.txt"  # 黑名单关键词存储文件
 SIZE_THRESHOLD_MB = int(os.getenv("SIZE_THRESHOLD", "300"))  # 有效文件的最小体积阈值
+MAX_REPORT_LINES = int(os.getenv("MAX_REPORT_LINES", "60"))
+
+DEFAULT_BLACKLIST = ["广告", "promo", ".url", ".txt", "readme", "扫码", "最新地址"]
+EXTENSION_ALIASES = {"txt": ".txt", "url": ".url", "nfo": ".nfo", "md": ".md"}
 
 # 配置日志输出，方便在 Docker 日志中查看运行状态
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+CLEAN_LOCK = asyncio.Lock()
+
+
+def parse_admin_ids(raw_value: str) -> list[int]:
+    ids: list[int] = []
+    invalid: list[str] = []
+    for item in raw_value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if item.isdigit():
+            ids.append(int(item))
+        else:
+            invalid.append(item)
+    if invalid:
+        logger.warning(f"ADMIN_IDS 中存在无效值(已忽略): {', '.join(invalid)}")
+    return ids
+
+
+ADMIN_IDS = parse_admin_ids(os.getenv("ADMIN_IDS", ""))
+
+
+def validate_config() -> None:
+    missing: list[str] = []
+    if not CD2_TOKEN.strip():
+        missing.append("CD2_TOKEN")
+    if not TG_BOT_TOKEN.strip():
+        missing.append("TG_TOKEN")
+    if not ADMIN_IDS:
+        missing.append("ADMIN_IDS")
+    if missing:
+        raise RuntimeError(f"缺少必要环境变量: {', '.join(missing)}")
+    if SIZE_THRESHOLD_MB <= 0:
+        raise RuntimeError("SIZE_THRESHOLD 必须为正整数")
+    if MAX_REPORT_LINES <= 0:
+        raise RuntimeError("MAX_REPORT_LINES 必须为正整数")
+    CronTrigger.from_crontab(CLEAN_CRON)
 
 
 # ==========================================
@@ -46,15 +85,38 @@ logger = logging.getLogger(__name__)
 def get_blacklist():
     """读取黑名单配置，若文件不存在则创建默认列表"""
     if not os.path.exists(BLACKLIST_FILE):
-        default_list = ["广告", "promo", ".url", "txt", "readme", "扫码", "最新地址"]
         with open(BLACKLIST_FILE, "w", encoding="utf-8") as f:
-            for k in default_list: f.write(f"{k}\n")
-        return default_list
+            for k in DEFAULT_BLACKLIST:
+                f.write(f"{k}\n")
+        return DEFAULT_BLACKLIST
     with open(BLACKLIST_FILE, "r", encoding="utf-8") as f:
         return [line.strip() for line in f if line.strip()]
 
 
-async def clean_task_folder(stub, metadata, folder_path) -> str | None:
+def compile_blacklist_rules(blacklist: list[str]) -> tuple[set[str], list[str]]:
+    ext_rules: set[str] = set()
+    keyword_rules: list[str] = []
+    for raw in blacklist:
+        item = raw.strip().lower()
+        if not item:
+            continue
+        if item in EXTENSION_ALIASES:
+            ext_rules.add(EXTENSION_ALIASES[item])
+            continue
+        if item.startswith(".") and len(item) > 1 and " " not in item:
+            ext_rules.add(item)
+            continue
+        keyword_rules.append(item)
+    return ext_rules, keyword_rules
+
+
+def should_delete_file(file_name: str, ext_rules: set[str], keyword_rules: list[str]) -> bool:
+    lower_name = file_name.lower()
+    extension = os.path.splitext(lower_name)[1]
+    return extension in ext_rules or any(k in lower_name for k in keyword_rules)
+
+
+async def clean_task_folder(stub, metadata, folder_path, ext_rules: set[str], keyword_rules: list[str]) -> str | None:
     """
     对单个任务文件夹执行清理动作:
     - 删除匹配关键词的广告文件。
@@ -71,11 +133,10 @@ async def clean_task_folder(stub, metadata, folder_path) -> str | None:
         # 场景 A: 空文件夹直接移除
         if not sub_files:
             await stub.DeleteFiles(clouddrive_pb2.MultiFileRequest(path=[folder_path]), metadata=metadata)
-            return f"🗑️ 发现空目录已删除: `{folder_name}`"
+            return f"🗑️ 发现空目录已删除: {folder_name}"
 
         # 场景 B: 匹配黑名单关键词
-        current_black = get_blacklist()
-        files_to_delete = [f.fullPathName for f in sub_files if any(k.lower() in f.name.lower() for k in current_black)]
+        files_to_delete = [f.fullPathName for f in sub_files if should_delete_file(f.name, ext_rules, keyword_rules)]
         delete_count = len(files_to_delete)
 
         if files_to_delete:
@@ -88,36 +149,61 @@ async def clean_task_folder(stub, metadata, folder_path) -> str | None:
         if not remaining:
             # 清理后变为空，执行删除
             await stub.DeleteFiles(clouddrive_pb2.MultiFileRequest(path=[folder_path]), metadata=metadata)
-            return f"🗑️ 清理了 {delete_count} 个垃圾文件，变为空目录已删除: `{folder_name}`"
+            return f"🗑️ 清理了 {delete_count} 个垃圾文件，变为空目录已删除: {folder_name}"
 
         if max_size < SIZE_THRESHOLD_MB * 1024 * 1024:
             # 即使有文件，但如果都是几 MB 的小文件，也判定为无效任务
             await stub.DeleteFiles(clouddrive_pb2.MultiFileRequest(path=[folder_path]), metadata=metadata)
-            return f"⚠️ 任务体积过小({max_size // (1024 * 1024)}MB)，已整体清理: `{folder_name}`"
+            return f"⚠️ 任务体积过小({max_size // (1024 * 1024)}MB)，已整体清理: {folder_name}"
 
-        return f"🧹 已从 `{folder_name}` 中移除 {delete_count} 个垃圾文件。" if delete_count > 0 else None
+        return f"🧹 已从 {folder_name} 中移除 {delete_count} 个垃圾文件。" if delete_count > 0 else None
     except Exception as e:
         logger.error(f"处理文件夹 {folder_name} 出错: {str(e)}")
-        return f"❌ 处理 `{folder_name}` 异常: {str(e)}"
+        return f"❌ 处理 {folder_name} 异常: {str(e)}"
 
 
 async def run_auto_clean():
     """定时任务调用的主扫描函数"""
-    logger.info("⏰ [Schedule] 启动定时自动化清理任务...")
-    try:
-        async with grpc.aio.insecure_channel(CD2_IP_PORT) as channel:
-            stub = clouddrive_pb2_grpc.CloudDriveFileSrvStub(channel)
-            metadata = [('authorization', f'Bearer {CD2_TOKEN}')]
-            root_req = clouddrive_pb2.ListSubFileRequest(path=SAVE_PATH)
+    if CLEAN_LOCK.locked():
+        logger.warning("⏭️ [Schedule] 已有清理任务在执行，跳过本次触发。")
+        return
 
-            async for reply in stub.GetSubFiles(root_req, metadata=metadata, timeout=30):
-                if reply.subFiles:
-                    for f in reply.subFiles:
-                        if f.isDirectory:
-                            await clean_task_folder(stub, metadata, f.fullPathName)
-        logger.info("✅ [Schedule] 自动清理任务执行完毕。")
-    except Exception as e:
-        logger.error(f"❌ [Schedule] 自动任务运行失败: {str(e)}")
+    async with CLEAN_LOCK:
+        logger.info("⏰ [Schedule] 启动定时自动化清理任务...")
+        scanned_dirs = 0
+        actions = 0
+        blacklist = get_blacklist()
+        ext_rules, keyword_rules = compile_blacklist_rules(blacklist)
+        try:
+            async with grpc.aio.insecure_channel(CD2_IP_PORT) as channel:
+                stub = clouddrive_pb2_grpc.CloudDriveFileSrvStub(channel)
+                metadata = [('authorization', f'Bearer {CD2_TOKEN}')]
+                root_req = clouddrive_pb2.ListSubFileRequest(path=SAVE_PATH)
+
+                async for reply in stub.GetSubFiles(root_req, metadata=metadata, timeout=30):
+                    if reply.subFiles:
+                        for f in reply.subFiles:
+                            if f.isDirectory:
+                                scanned_dirs += 1
+                                result = await clean_task_folder(stub, metadata, f.fullPathName, ext_rules, keyword_rules)
+                                if result:
+                                    actions += 1
+            logger.info(f"✅ [Schedule] 自动清理任务执行完毕。扫描目录: {scanned_dirs}, 产生动作: {actions}")
+        except Exception as e:
+            logger.error(f"❌ [Schedule] 自动任务运行失败: {str(e)}")
+
+
+def build_clean_report(results: list[str]) -> str:
+    if not results:
+        return "✅ 下载目录非常整洁，无需清理。"
+
+    shown = results[:MAX_REPORT_LINES]
+    lines = [f"📊 清理报告（共 {len(results)} 项）"]
+    lines.extend(shown)
+    omitted = len(results) - len(shown)
+    if omitted > 0:
+        lines.append(f"... 其余 {omitted} 项已省略")
+    return "\n".join(lines)
 
 
 # ==========================================
@@ -131,7 +217,12 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """监听并处理发送的磁力链接、HTTP、电驴链接"""
-    if update.effective_user.id not in ADMIN_IDS: return
+    if not update.effective_user or not update.message or not update.message.text:
+        return
+    if update.effective_user.id not in ADMIN_IDS:
+        logger.warning(f"拒绝非管理员提交链接请求: user_id={update.effective_user.id}")
+        await update.message.reply_text("⛔ 你没有权限操作此机器人。")
+        return
     text = update.message.text.strip()
 
     if any(text.startswith(p) for p in ["magnet:", "http", "ed2k://"]):
@@ -143,7 +234,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 res = await stub.AddOfflineFiles(req, metadata=metadata, timeout=15)
                 if res.success:
                     await update.message.reply_text(
-                        f"✅ 提交成功！\n📂 目录：`{SAVE_PATH}`\n提示：完成后发送 /clean 执行清理。")
+                        f"✅ 提交成功！\n📂 目录：{SAVE_PATH}\n提示：完成后发送 /clean 执行清理。")
                 else:
                     await update.message.reply_text(f"❌ CD2 拒绝请求: {res.errorMessage}")
         except Exception as e:
@@ -152,30 +243,50 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_clean(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """手动清理命令 (/clean)"""
-    if update.effective_user.id not in ADMIN_IDS: return
+    if not update.effective_user or not update.message:
+        return
+    if update.effective_user.id not in ADMIN_IDS:
+        logger.warning(f"拒绝非管理员清理请求: user_id={update.effective_user.id}")
+        await update.message.reply_text("⛔ 你没有权限操作此机器人。")
+        return
+    if CLEAN_LOCK.locked():
+        await update.message.reply_text("⏳ 当前已有清理任务在执行，请稍后再试。")
+        return
+
     status_msg = await update.message.reply_text("🔍 正在全量扫描目录，请稍后...")
     results: list[str] = []
+    scanned_dirs = 0
+    blacklist = get_blacklist()
+    ext_rules, keyword_rules = compile_blacklist_rules(blacklist)
     try:
-        async with grpc.aio.insecure_channel(CD2_IP_PORT) as channel:
-            stub = clouddrive_pb2_grpc.CloudDriveFileSrvStub(channel)
-            metadata = [('authorization', f'Bearer {CD2_TOKEN}')]
-            root_req = clouddrive_pb2.ListSubFileRequest(path=SAVE_PATH)
-            async for reply in stub.GetSubFiles(root_req, metadata=metadata, timeout=30):
-                if reply.subFiles:
-                    for f in reply.subFiles:
-                        if f.isDirectory:
-                            res = await clean_task_folder(stub, metadata, f.fullPathName)
-                            if res: results.append(res)
+        async with CLEAN_LOCK:
+            async with grpc.aio.insecure_channel(CD2_IP_PORT) as channel:
+                stub = clouddrive_pb2_grpc.CloudDriveFileSrvStub(channel)
+                metadata = [('authorization', f'Bearer {CD2_TOKEN}')]
+                root_req = clouddrive_pb2.ListSubFileRequest(path=SAVE_PATH)
+                async for reply in stub.GetSubFiles(root_req, metadata=metadata, timeout=30):
+                    if reply.subFiles:
+                        for f in reply.subFiles:
+                            if f.isDirectory:
+                                scanned_dirs += 1
+                                res = await clean_task_folder(stub, metadata, f.fullPathName, ext_rules, keyword_rules)
+                                if res:
+                                    results.append(res)
 
-        report = "\n".join(results) if results else "✅ 下载目录非常整洁，无需清理。"
-        await status_msg.edit_text(f"📊 **清理报告：**\n{report}", parse_mode='Markdown')
+        logger.info(f"🧾 [Manual] 手动清理完成。扫描目录: {scanned_dirs}, 产生动作: {len(results)}")
+        await status_msg.edit_text(build_clean_report(results))
     except Exception as e:
-        await status_msg.edit_text(f"❌ 无法执行清理: `{str(e)}`")
+        await status_msg.edit_text(f"❌ 无法执行清理: {str(e)}")
 
 
 async def cmd_blacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """管理黑名单关键词 (/blacklist)"""
-    if update.effective_user.id not in ADMIN_IDS: return
+    if not update.effective_user or not update.message:
+        return
+    if update.effective_user.id not in ADMIN_IDS:
+        logger.warning(f"拒绝非管理员黑名单请求: user_id={update.effective_user.id}")
+        await update.message.reply_text("⛔ 你没有权限操作此机器人。")
+        return
     current = get_blacklist()
     if context.args:
         new_word = " ".join(context.args)
@@ -183,9 +294,9 @@ async def cmd_blacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
             current.append(new_word)
             with open(BLACKLIST_FILE, "w", encoding="utf-8") as f:
                 for k in current: f.write(f"{k}\n")
-            await update.message.reply_text(f"➕ 已添加黑名单关键词: `{new_word}`", parse_mode='Markdown')
+            await update.message.reply_text(f"➕ 已添加黑名单关键词: {new_word}")
     else:
-        await update.message.reply_text(f"📝 当前黑名单:\n`{', '.join(current)}`", parse_mode='Markdown')
+        await update.message.reply_text(f"📝 当前黑名单:\n{', '.join(current)}")
 
 
 async def post_init(application):
@@ -205,7 +316,10 @@ async def post_init(application):
         # job_queue 内部包含了一个配置好的 apscheduler 实例
         application.job_queue.scheduler.add_job(
             run_auto_clean, 
-            CronTrigger.from_crontab(CLEAN_CRON)
+            CronTrigger.from_crontab(CLEAN_CRON),
+            id="auto_clean",
+            replace_existing=True,
+            coalesce=True
         )
         logger.info(f"📅 定时任务系统已启动(基于内置JobQueue)，Cron 设定: [{CLEAN_CRON}]")
     else:
@@ -215,6 +329,8 @@ async def post_init(application):
 # ==========================================
 # 4. 程序入口
 if __name__ == '__main__':
+    validate_config()
+
     # 代理网络配置
     request_kwargs = {
         "connection_pool_size": 8,

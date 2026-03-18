@@ -12,4 +12,6 @@ services:
       - SAVE_PATH=/115/离线下载             # 下载保存路径
       - ADMIN_IDS=你的数字ID                # 你的 TG 用户 ID
       - SIZE_THRESHOLD=300                  # 判定删除的体积阈值 (MB)
+      - MAX_REPORT_LINES=60                 # 清理报告最多展示条目数
+      - CLEAN_CRON=30 3 * * *               # 每天 03:30 自动清理
       - PROXY_URL=http://192.168.31.10:7890 # 代理地址（非必须）
