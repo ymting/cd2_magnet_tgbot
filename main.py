@@ -126,7 +126,12 @@ async def run_auto_clean():
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """全局错误拦截器，防止网络波动直接让程序崩溃"""
-    logger.error(f"⚠️ 机器人运行时捕获到异常: {context.error}")
+    error = context.error
+    logger.error(f"⚠️ 机器人运行时捕获到异常: {error}")
+
+    # 对于网络连接错误，记录更详细的信息
+    if "ConnectError" in str(error) or "ConnectTimeout" in str(error):
+        logger.warning("🌐 网络连接异常，代理可能不稳定，正在等待自动重试...")
 
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -247,4 +252,13 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler("blacklist", cmd_blacklist))
 
     logger.info("🚀 CD2 Bot 已启动，正在轮询消息...")
-    app.run_polling()
+    # 配置重试参数：连接失败时自动重试，避免短暂网络波动导致停止
+    # reconnect_delay: 首次失败后等待秒数
+    # error_backoff: 连续失败时等待时间的倍数（指数退避）
+    app.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES,
+        retry_on_error=True,       # 遇到错误时重试
+        reconnect_delay=2.0,       # 首次失败等待 2 秒
+        error_backoff=1.5,         # 连续失败: 2s → 3s → 4.5s → 6.75s (上限60s)
+    )
