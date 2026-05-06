@@ -1,5 +1,7 @@
 # CloudDrive2 Telegram 下载管理器
 
+**版本: 1.1.2**
+
 项目简介：
 这是一个专为 CloudDrive2 (CD2) 开发的 Telegram 机器人助手。它能够接收磁力链接、HTTP 链接及 ed2k 链接，并自动提交至 CD2 执行离线下载，同时提供强大的自动化后期清理功能。
 
@@ -70,7 +72,18 @@ services:
 
 ## 🛠️ 更新日志
 
-* **最新修复**：彻底解决了由于定时调度器 (APScheduler) 与 gRPC/Telegram 异步循环冲突导致的进程“假死”（已读不回）问题。当前版本已改为使用 Telegram 原生 `JobQueue` 调度定时清理任务，极大提升了长期运行的稳定性。
+### v1.1.2 (2026-05-06)
+* **新增轮询重试机制**：为 `run_polling` 配置指数退避重试参数，解决代理不稳定导致的连接中断问题
+    - `reconnect_delay=2.0`：首次失败等待 2 秒
+    - `error_backoff=1.5`：连续失败时采用指数退避策略
+* **增强错误日志**：对 ConnectError/ConnectTimeout 等网络错误添加更详细的提示信息
+
+### v1.1.1
+* **修复代理配置**：为 Updater 补充 `get_updates_request` 代理配置，解决因 getUpdates 未走代理导致机器人无法收到指令（已读不回）的问题
+* **适配 v22+ API**：解决配置 HTTPXRequest 时出现 'proxy_url' 意外参数的 TypeError
+
+### v1.1.0
+* **彻底解决假死问题**：改用 Telegram 原生 `JobQueue` 调度定时清理任务，避免 APScheduler 与 gRPC/Telegram 异步循环冲突
 
 ---
 
