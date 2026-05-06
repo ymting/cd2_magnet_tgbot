@@ -256,13 +256,9 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler("blacklist", cmd_blacklist))
 
     logger.info("🚀 CD2 Bot 已启动，正在轮询消息...")
-    # 配置重试参数：连接失败时自动重试，避免短暂网络波动导致停止
-    # reconnect_delay: 首次失败后等待秒数
-    # error_backoff: 连续失败时等待时间的倍数（指数退避）
+    # python-telegram-bot 的 run_polling 默认在遇到网络错误时会自动重试
+    # 通过 error_handler 捕获并记录异常，无需额外配置重试参数
     app.run_polling(
         drop_pending_updates=True,
         allowed_updates=Update.ALL_TYPES,
-        retry_on_error=True,       # 遇到错误时重试
-        reconnect_delay=2.0,       # 首次失败等待 2 秒
-        error_backoff=1.5,         # 连续失败: 2s → 3s → 4.5s → 6.75s (上限60s)
     )
