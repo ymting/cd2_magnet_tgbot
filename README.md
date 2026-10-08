@@ -42,9 +42,9 @@ services:
       - ADMIN_IDS=1234567,8901234            # 管理员数字 ID，多个用逗号隔开
       - SIZE_THRESHOLD=300                   # 判定垃圾任务的体积阈值 (MB)
       - PROXY_URL=http://192.168.31.10:7890  # 可选：访问 Telegram 的代理地址
-      - NETWORK_ERROR_RESET_SECONDS=300      # 网络异常静默多久后重新计数（秒）
-      - WATCHDOG_INTERVAL_SECONDS=60         # 轮询看门狗检查周期（秒），0 表示关闭
-      - CLEAN_CRON=30 3 * * *
+      - NETWORK_ERROR_RESET_SECONDS=300      # 网络异常静默多久后重新计数（秒），仅用于日志诊断
+      - WATCHDOG_INTERVAL_SECONDS=60         # 轮询看门狗周期（秒）：默认开启，不需要此功能就设为 0
+      - CLEAN_CRON=30 3 * * *                # 定时清理任务的 Cron 表达式（默认每天 03:30）
 
 ```
 ---
