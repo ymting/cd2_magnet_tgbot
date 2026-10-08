@@ -30,15 +30,25 @@ pip install -r requirements.txt
 # Regenerate gRPC files (if clouddrive.proto changes)
 python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. clouddrive.proto
 ```
+> `requirements.txt` is **unpinned**, but the proxy and `JobQueue` patterns require **python-telegram-bot v22+**. If a fresh install resolves an older major version, the bot will break (proxy API and JobQueue behavior differ).
+
+### Tests
+Unit tests live in `tests/` and need no network access:
+
+```bash
+python -m unittest tests.test_polling_watchdog tests.test_network_error_handling
+```
+
+Integration behavior still requires `python main.py` against a live CloudDrive2 instance (or watching `docker-compose` logs).
 
 ## Architecture
 
 ### Single-File Design
-All business logic resides in `main.py` (~320 lines). The code is organized into 4 sections:
-1. **Variable Configuration** (lines 30-48): Environment variables and constants
-2. **Core Cleanup Logic** (lines 54-176): Recursive scanning, file deletion, empty directory cleanup
-3. **Telegram Handlers** (lines 182-257): `handle_link()`, `cmd_clean()`, `cmd_blacklist()`
-4. **Entry Point** (lines 260-324): Bot initialization and startup
+All business logic resides in `main.py` (~335 lines; version string in `__version__`). The code is organized into 4 commented sections (referenced by function name since line numbers drift):
+1. **Variable Configuration**: env vars → module constants (note the renames, see Environment Variables below)
+2. **Core Cleanup Logic**: `get_blacklist()`, `get_all_items_recursive()`, `is_directory_empty()`, `clean_task_folder()`, `run_auto_clean()`
+3. **Telegram Handlers**: `error_handler()`, `handle_link()`, `cmd_clean()`, `cmd_blacklist()`, `post_init()`
+4. **Entry Point** (`__main__`): proxy/`HTTPXRequest` setup, `ApplicationBuilder` wiring, `run_polling()`
 
 ### Key Components
 
@@ -107,13 +117,24 @@ all_dirs.sort(key=lambda x: x.fullPathName.count('/'), reverse=True)
 | SIZE_THRESHOLD | No | 300 | Files smaller than this (MB) are deleted |
 | PROXY_URL | No | - | Proxy for Telegram (http/socks5) |
 | CLEAN_CRON | No | 30 3 * * * | Cleanup cron expression |
-| MAX_RETRIES | No | 10 | Max network error retries |
+| NETWORK_ERROR_RESET_SECONDS | No | 300 | Silence window before network-error counting restarts (log only) |
+| WATCHDOG_INTERVAL_SECONDS | No | 60 | Polling watchdog check interval in seconds (0 disables it) |
+
+**Gotcha — env var name ≠ internal constant name.** When grepping `main.py`, the Python constant differs from the Docker env var:
+- `CD2_ADDRESS` → `CD2_IP_PORT`
+- `TG_TOKEN` → `TG_BOT_TOKEN`
+- `SIZE_THRESHOLD` → `SIZE_THRESHOLD_MB`
+- `NETWORK_ERROR_RESET_SECONDS` / `WATCHDOG_INTERVAL_SECONDS` keep the same name as the env var
+
+`SIZE_THRESHOLD` is interpreted in **MB** and converted to bytes (`SIZE_THRESHOLD_MB * 1024 * 1024`) inside `clean_task_folder()`.
 
 ## Critical Implementation Notes
 
 1. **Proxy Configuration**: Both `request` and `get_updates_request` must have proxy configured, otherwise the bot won't receive messages (已读不回 issue)
 
-2. **Scheduled Tasks**: Never use standalone `AsyncIOScheduler` - it causes event loop conflicts with gRPC/Telegram. Use the built-in `JobQueue` instead.
+2. **Scheduled Tasks**: Never use standalone `AsyncIOScheduler` - it causes event loop conflicts with gRPC/Telegram. Use the built-in `JobQueue` instead (the scheduler is registered in `post_init()`). Note: `AsyncIOScheduler` is still imported at the top of `main.py` but is intentionally **unused** — do not wire it up. The polling watchdog (`watchdog_check`) is also registered there via `job_queue.run_repeating`.
+
+2b. **Polling Watchdog**: PTB maps HTTP 401/404 to `InvalidToken` and its `network_retry_loop` re-raises it without calling `on_err_cb`, so the polling task dies silently while the process keeps running. `watchdog_check` polls `updater._Updater__polling_task` (a private attribute, guarded with `getattr`) and calls `application.stop_running()` when it finds the task already done. Only treat it as a failure when `application.running` is still true, otherwise normal shutdowns would be misreported. This path exits with code 1, which is fine for `always` / `unless-stopped` / `on-failure` restart policies.
 
 3. **gRPC Timeout**: All gRPC calls must have timeout (15-30s) to prevent hanging when CD2 mount points are stuck.
 
@@ -125,6 +146,8 @@ all_dirs.sort(key=lambda x: x.fullPathName.count('/'), reverse=True)
 
 ## Release Process
 
-1. Update version in `main.py` (`__version__`) and `README.md`
+1. Update version in `main.py` (`__version__`) and `README.md` — these are **informational only** and kept in sync by hand.
 2. Create and push a version tag: `git tag v1.x.x && git push origin v1.x.x`
-3. GitHub Actions automatically builds and pushes Docker image to `ghcr.io/ymting/cd2_magnet_tgbot`
+3. `.github/workflows/docker-publish.yml` triggers on `v*` tags (or manual `workflow_dispatch`) and pushes to `ghcr.io/<owner>/cd2_magnet_tgbot` (i.e. `ghcr.io/ymting/...`), tagging both the **semver from the git tag** and `latest`.
+
+The published image version comes from the **git tag**, not from `__version__` — the git tag is the source of truth.

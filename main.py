@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 项目名称: CloudDrive2 Telegram 离线下载管家
-版本: 1.1.5
+版本: 1.1.6
 功能描述:
     1. 链接监听: 自动识别 Magnet、HTTP、ed2k 链接并提交至 CD2 离线下载。
     2. 定时清理: 基于 Cron 表达式，递归扫描下载目录，删除小文件和黑名单文件，清理空目录。
     3. 异常容错: 增加全局错误处理与 gRPC 超时控制，防止网络波动导致假死。
+    4. 轮询看门狗: 周期检测 Telegram 轮询协程是否已死亡，避免「容器活着但收不到消息」的永久静默。
 作者: ymting
 """
 
@@ -19,7 +20,7 @@ import clouddrive_pb2_grpc
 from datetime import datetime
 
 # 版本号
-__version__ = "1.1.5"
+__version__ = "1.1.6"
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from telegram import Update, BotCommand
@@ -42,6 +43,10 @@ SIZE_THRESHOLD_MB = int(os.getenv("SIZE_THRESHOLD", "300"))  # 有效文件的�
 NETWORK_ERROR_RESET_SECONDS = int(os.getenv("NETWORK_ERROR_RESET_SECONDS", "300"))
 if NETWORK_ERROR_RESET_SECONDS <= 0:
     raise ValueError("NETWORK_ERROR_RESET_SECONDS 必须是大于 0 的整数")
+# 轮询看门狗的检查周期(秒)。设为 0 表示关闭看门狗。
+WATCHDOG_INTERVAL_SECONDS = int(os.getenv("WATCHDOG_INTERVAL_SECONDS", "60"))
+if WATCHDOG_INTERVAL_SECONDS < 0:
+    raise ValueError("WATCHDOG_INTERVAL_SECONDS 不能为负数")
 
 # 配置日志输出，方便在 Docker 日志中查看运行状态
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -236,6 +241,62 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     logger.error("⚠️ 机器人运行时捕获到非网络异常: %s", error)
 
 
+def _get_polling_task(updater: object) -> object | None:
+    """取出 Updater 内部持有的轮询协程任务对象。
+
+    python-telegram-bot 把轮询任务存放在私有属性 `__polling_task`，
+    按 Python 名称改写规则，外部访问到的名字是 `_Updater__polling_task`。
+    这里用 getattr 防御式取值：一旦未来版本调整内部结构，看门狗自身
+    不会因为 AttributeError 而崩溃，只会安静地不工作。
+    """
+    return getattr(updater, "_Updater__polling_task", None)
+
+
+async def watchdog_check(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """轮询看门狗：发现 Telegram 轮询协程已死亡时，主动退出以便容器重启自愈。
+
+    为什么需要它（v1.1.5 未能覆盖的真实故障）：
+        PTB 的 network_retry_loop 会把 HTTP 401/404 映射为 InvalidToken，
+        而 `except InvalidToken` 分支排在 `except TelegramError` 之前，
+        且只记日志后直接 `raise`，不会调用 on_err_cb。
+        结果是：轮询协程带着异常结束，但进程仍然存活，
+        全局 error_handler 也完全捕获不到任何异常。
+        对外表现就是「容器 running、重启次数 0、却再也收不到任何消息」的永久静默。
+
+    本任务周期检查轮询任务的状态：一旦发现它已结束（而应用理应还在运行），
+    就记录 CRITICAL 并调用 stop_running() 让进程退出，
+    交由 Docker 的 restart: always 完成重启，把「永久静默」降级为「最多静默一个检查周期」。
+    """
+    application = context.application
+
+    # 应用正在正常关闭时，PTB 自己会取消轮询任务，这种情况不是故障，必须放行
+    if not application.running:
+        return
+
+    updater = application.updater
+    if updater is None:
+        return
+
+    polling_task = _get_polling_task(updater)
+    # 还没启动轮询，说明应用仍在 bootstrap 阶段，交由 PTB 自身的重试逻辑处理
+    if polling_task is None or not polling_task.done():
+        return
+
+    if polling_task.cancelled():
+        reason = "轮询任务被取消"
+    else:
+        error = polling_task.exception()
+        reason = f"{type(error).__name__}: {error}" if error else "轮询任务已结束（无异常）"
+
+    logger.critical(
+        "🛑 检测到 Telegram 轮询已停止：%s。"
+        "这通常意味着 401/404 触发了 InvalidToken 并绕过了错误处理器。"
+        "现在主动退出进程，交由 Docker restart 策略重启自愈。",
+        reason,
+    )
+    application.stop_running()
+
+
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """监听并处理发送的磁力链接、HTTP、电驴链接"""
     if update.effective_user.id not in ADMIN_IDS: return
@@ -303,6 +364,7 @@ async def post_init(application):
     机器人启动后的初始化:
     - 注册手机端指令菜单。
     - 在运行中的事件循环内启动 Cron 调度器，解决 RuntimeError 问题。
+    - 注册轮询看门狗，兜底 Telegram 轮询协程静默死亡的场景。
     """
     await application.bot.set_my_commands([
         BotCommand("clean", "手动扫描下载目录并清理"),
@@ -318,6 +380,19 @@ async def post_init(application):
             CronTrigger.from_crontab(CLEAN_CRON)
         )
         logger.info(f"📅 定时任务系统已启动(基于内置JobQueue)，Cron 设定: [{CLEAN_CRON}]")
+
+        # 轮询看门狗：周期性检查 Telegram 轮询协程是否还活着，
+        # 防止 401/404 → InvalidToken 导致的「进程活着但收不到消息」永久静默。
+        if WATCHDOG_INTERVAL_SECONDS > 0:
+            application.job_queue.run_repeating(
+                watchdog_check,
+                interval=WATCHDOG_INTERVAL_SECONDS,
+                first=WATCHDOG_INTERVAL_SECONDS,
+                name="polling_watchdog",
+            )
+            logger.info(f"🐶 轮询看门狗已启动，检查周期 {WATCHDOG_INTERVAL_SECONDS} 秒。")
+        else:
+            logger.warning("⚠️ 轮询看门狗已被禁用 (WATCHDOG_INTERVAL_SECONDS=0)。")
     else:
         logger.error("❌ 无法启动定时清理任务：内置的 JobQueue 未初始化。")
 

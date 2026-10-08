@@ -14,3 +14,4 @@ services:
       - SIZE_THRESHOLD=300                  # 判定删除的体积阈值 (MB)
       - PROXY_URL=http://192.168.31.10:7890 # 代理地址（非必须）
       - NETWORK_ERROR_RESET_SECONDS=300     # 网络异常静默多久后重新计数（秒）
+      - WATCHDOG_INTERVAL_SECONDS=60        # 轮询看门狗检查周期（秒），0 表示关闭

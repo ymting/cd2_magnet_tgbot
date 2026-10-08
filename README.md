@@ -1,6 +1,6 @@
 # CloudDrive2 Telegram 下载管理器
 
-**版本: 1.1.5**
+**版本: 1.1.6**
 
 项目简介：
 这是一个专为 CloudDrive2 (CD2) 开发的 Telegram 机器人助手。它能够接收磁力链接、HTTP 链接及 ed2k 链接，并自动提交至 CD2 执行离线下载，同时提供强大的自动化后期清理功能。
@@ -16,6 +16,7 @@
     - **黑名单过滤**：对大于阈值的文件，检查是否匹配黑名单关键词（如广告、.url、.txt 等），匹配则删除。
     - **空目录移除**：文件清理后，自动删除变为空的子目录。
 * 网络代理支持：支持 http 和 socks5 代理，解决国内服务器无法连接 Telegram API 的问题。
+* 轮询看门狗：周期检查 Telegram 轮询协程是否已停止，一旦发现异常静默就主动退出，交由 Docker 重启自愈，避免「容器在跑却收不到消息」。
 * 自动命令菜单：机器人启动后会自动向 Telegram 注册 /clean 和 /blacklist 命令菜单。
 * 安全保障：严格校验 ADMIN_IDS，仅限管理员操作。
 
@@ -42,6 +43,7 @@ services:
       - SIZE_THRESHOLD=300                   # 判定垃圾任务的体积阈值 (MB)
       - PROXY_URL=http://192.168.31.10:7890  # 可选：访问 Telegram 的代理地址
       - NETWORK_ERROR_RESET_SECONDS=300      # 网络异常静默多久后重新计数（秒）
+      - WATCHDOG_INTERVAL_SECONDS=60         # 轮询看门狗检查周期（秒），0 表示关闭
       - CLEAN_CRON=30 3 * * *
 
 ```
@@ -59,6 +61,7 @@ services:
 | SIZE_THRESHOLD | 否  | 300 | 文件体积小于此值(MB)将被删除，大于等于此值时检查黑名单 |
 | PROXY_URL      | 否  | - | 连接 Telegram 的代理，支持 http/socks5 |
 | NETWORK_ERROR_RESET_SECONDS | 否 | 300 | 网络异常静默达到此秒数后开始新一轮计数，仅用于日志诊断 |
+| WATCHDOG_INTERVAL_SECONDS | 否 | 60 | 轮询看门狗的检查周期（秒），设为 0 可关闭看门狗 |
 | CLEAN_CRON     | 否  |  30 3 * * * | 定时清理任务的 Cron 表达式|
 
 
@@ -74,6 +77,11 @@ services:
 ---
 
 ## 🛠️ 更新日志
+
+### v1.1.6 (2026-10-08)
+* **修复「永久静默」故障**：当 Telegram 返回 401/404 时，`python-telegram-bot` 会将其映射为 `InvalidToken` 并直接终止轮询协程，且不经过全局错误处理器。此前表现为「容器 running、重启次数 0、却再也收不到任何消息」。本版新增**轮询看门狗**，周期性检查轮询协程是否仍然存活，一旦发现已停止就记录 CRITICAL 并主动退出进程，交由 Docker 的 `restart` 策略重启自愈。
+* **新增看门狗配置**：`WATCHDOG_INTERVAL_SECONDS` 默认 60 秒，设为 `0` 可关闭看门狗。
+* **说明**：v1.1.5 的代码此前已合并进主干，但从未发布过镜像 tag；v1.1.6 是首个包含网络异常修复的正式发布镜像。
 
 ### v1.1.5 (2026-07-15)
 * **修复网络异常累计问题**：网络恢复后不再把历史错误永久累计到退出阈值
