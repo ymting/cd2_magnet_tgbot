@@ -12,6 +12,7 @@
 
 import logging
 import os
+import re
 import time
 import grpc
 import asyncio
@@ -51,6 +52,41 @@ if WATCHDOG_INTERVAL_SECONDS < 0:
 # 配置日志输出，方便在 Docker 日志中查看运行状态
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+class TokenRedactionFilter(logging.Filter):
+    """把日志中出现的 Telegram Bot Token 替换为占位符，避免凭据随日志外泄。
+
+    背景：httpx 会以 INFO 级别打印完整请求 URL，形如
+        HTTP Request: POST https://api.telegram.org/bot<数字ID>:<密钥>/getUpdates "HTTP/1.1 200 OK"
+    Bot Token 就嵌在 URL 路径里。这些日志落到 `docker logs`、被截图或被粘贴到
+    聊天里求助时，等同于明文泄露密钥（拿到即可完全接管机器人）。
+
+    这里只做脱敏、不做屏蔽：保留请求日志用于排查网络问题，但抹掉密钥本身。
+    """
+
+    # Telegram Bot Token 的形态固定：<bot 数字 ID>:<35 位左右 [A-Za-z0-9_-]>
+    _TOKEN_PATTERN = re.compile(r"bot\d{6,}:[A-Za-z0-9_\-]{20,}")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        # httpx 走的是惰性格式化（msg 是模板、URL 在 record.args 里），
+        # 必须先渲染成完整消息才能替换；替换后清空 args，避免 formatter 二次格式化。
+        message = record.getMessage()
+        if "api.telegram.org/bot" not in message:
+            return True
+        redacted = self._TOKEN_PATTERN.sub("bot<TOKEN已脱敏>", message)
+        if redacted != message:
+            record.msg = redacted
+            record.args = ()
+        return True
+
+
+# 挂在日志 handler 上，而不是某个具体 logger 上：
+# Logger.filter 只在最初调用 handle() 的那个 logger 上执行，子 logger
+# （httpx / httpcore / telegram）向上传播时不会经过 root logger 的 filter，
+# 只有 handler 级别的 filter 才能拦住所有来源的记录。
+for _handler in logging.getLogger().handlers:
+    _handler.addFilter(TokenRedactionFilter())
 
 # 网络异常只按时间窗口分组记录，不再作为停止应用的条件
 _network_error_count = 0
