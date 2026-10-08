@@ -1,2 +1,23 @@
-# Memory 目录 - 不上传到 GitHub
+# 项目记忆 - 不上传到 GitHub
 memory/
+
+# 说明文档与临时资料 - 不上传到 GitHub
+/docs/
+
+# Python 缓存与字节码
+__pycache__/
+*.py[cod]
+
+# 虚拟环境
+.venv/
+
+# IDE 与本地工具配置
+.idea/
+.claude/
+.codeartsdoer/
+.arts/
+*.code-workspace
+
+# 系统文件
+.DS_Store
+Thumbs.db
