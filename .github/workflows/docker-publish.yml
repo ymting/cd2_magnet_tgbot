@@ -14,7 +14,8 @@ jobs:
     name: 构建和上传任务
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      # 需要 write 才能在构建镜像后自动创建 GitHub Release
+      contents: write
       packages: write
 
     steps:
@@ -46,3 +47,15 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+      # 发布 GitHub Release。
+      # 说明：push tag 只会产生 git tag，不会出现在仓库的 Releases 页面，
+      # 必须显式创建 Release。仅在 tag 触发时执行，避免 workflow_dispatch 误发。
+      - name: 创建 GitHub Release (Create GitHub Release)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          # 每次 tag 发布都视为最新版本，保证 Releases 页面 Latest 不落后
+          make_latest: true
