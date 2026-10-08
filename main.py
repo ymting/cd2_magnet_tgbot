@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 项目名称: CloudDrive2 Telegram 离线下载管家
-版本: 1.1.6
+版本: 1.1.7
 功能描述:
     1. 链接监听: 自动识别 Magnet、HTTP、ed2k 链接并提交至 CD2 离线下载。
     2. 定时清理: 基于 Cron 表达式，递归扫描下载目录，删除小文件和黑名单文件，清理空目录。
@@ -21,7 +21,7 @@ import clouddrive_pb2_grpc
 from datetime import datetime
 
 # 版本号
-__version__ = "1.1.6"
+__version__ = "1.1.7"
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from telegram import Update, BotCommand

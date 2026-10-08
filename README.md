@@ -1,6 +1,6 @@
 # CloudDrive2 Telegram 下载管理器
 
-**版本: 1.1.6**
+**版本: 1.1.7**
 
 项目简介：
 这是一个专为 CloudDrive2 (CD2) 开发的 Telegram 机器人助手。它能够接收磁力链接、HTTP 链接及 ed2k 链接，并自动提交至 CD2 执行离线下载，同时提供强大的自动化后期清理功能。
@@ -77,6 +77,9 @@ services:
 ---
 
 ## 🛠️ 更新日志
+
+### v1.1.7 (2026-10-08)
+* **修复日志泄露凭据**：`httpx` 默认以 INFO 级别打印完整请求 URL，而 Bot Token 就嵌在 URL 路径里（`https://api.telegram.org/bot<ID>:<KEY>/getUpdates`），导致 `docker logs` 中出现明文 Token。现新增日志脱敏过滤器，把密钥替换为 `bot<TOKEN已脱敏>`，接口名与状态码保留，不影响排查网络问题。
 
 ### v1.1.6 (2026-10-08)
 * **修复「永久静默」故障**：当 Telegram 返回 401/404 时，`python-telegram-bot` 会将其映射为 `InvalidToken` 并直接终止轮询协程，且不经过全局错误处理器。此前表现为「容器 running、重启次数 0、却再也收不到任何消息」。本版新增**轮询看门狗**，周期性检查轮询协程是否仍然存活，一旦发现已停止就记录 CRITICAL 并主动退出进程，交由 Docker 的 `restart` 策略重启自愈。
