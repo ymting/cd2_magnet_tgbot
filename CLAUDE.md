@@ -47,7 +47,7 @@ Integration behavior still requires `python main.py` against a live CloudDrive2 
 All business logic resides in `main.py` (~580 lines; version string in `__version__`). The code is organized into 4 commented sections (referenced by function name since line numbers drift):
 1. **Variable Configuration**: env vars → module constants (note the renames, see Environment Variables below)
 2. **Core Cleanup Logic**: `get_blacklist()`, `get_all_items_recursive()`, `is_directory_empty()`, `clean_task_folder()`, `run_auto_clean()`
-3. **Telegram Handlers**: `error_handler()`, `_get_polling_task()`, `watchdog_check()`, `_mask_link()`, `_friendly_reject_reason()`, `_safe_send()`, `handle_link()`, `cmd_clean()`, `cmd_blacklist()`, `post_init()`
+3. **Telegram Handlers**: `error_handler()`, `_get_polling_task()`, `watchdog_check()`, `_mask_link()`, `_shorten()`, `_grpc_error_raw()`, `_is_transport_failure()`, `_classify_reject_reason()`, `_friendly_reject_reason()`, `_describe_submit_failure()`, `_safe_send()`, `handle_link()`, `cmd_clean()`, `cmd_blacklist()`, `post_init()`
 4. **Entry Point** (`__main__`): proxy/`HTTPXRequest` setup, `ApplicationBuilder` wiring, `run_polling()`
 
 ### Key Components
@@ -84,20 +84,33 @@ Convention:
 - If the reply cannot be delivered, log it — never tell the user the business action failed.
 - Long links go into logs via `_mask_link()` (magnet `dn=` payloads are huge).
 
-### User-Facing Rejection Messages (v1.1.9+)
-`FileOperationResult.errorMessage` is written for developers and often carries raw cloud-drive
-API text (English, error codes, even JSON). **Never forward it verbatim to the user.** Pass it
-through `_friendly_reject_reason()`, which classifies the message into a short human reply:
-- duplicate task (`已存在` / `already exist` / `duplicate` …) → `DUPLICATE_REPLY`, the most
-  common case, since re-sending a link is reported by CD2 as a rejection;
-- auth / permission → tell the user to check `CD2_TOKEN`;
-- unsupported link → say CD2 cannot handle that link;
-- anything else → strip CD2 action prefixes, truncate to `_REJECT_TEXT_LIMIT`, prefix with
-  `❌ 提交失败：`.
+### User-Facing Rejection Messages (v1.1.9+, extended in v1.1.10)
+Technical CD2 errors reach the user through **two independent paths** — both must be
+classified, and handling only one is a real bug that shipped in v1.1.9:
+- **(a) gRPC raises an exception.** Cloud-drive rejections are wrapped into gRPC status
+  codes. Measured 2026-10-09: 115open answers a duplicate link with
+  `StatusCode.INTERNAL` + `code: 10008` + `任务已存在，请勿输入重复的链接地址` — *not*
+  `success=False`. Handle via `_describe_submit_failure()`.
+- **(b) `FileOperationResult(success=False, errorMessage=...)`.** Developer-facing text that
+  often carries raw cloud-drive API content (English, error codes, JSON). Handle via
+  `_friendly_reject_reason()`.
 
-The raw message must always stay in the log (`logger.warning`) — simplification applies to the
-Telegram reply only. Adding a new category means adding keywords to the hint tuples and a test
-in `tests/test_reject_message_format.py`.
+Both share `_classify_reject_reason()`, which returns `DUPLICATE_REPLY` for duplicate hints
+(`已存在` / `已在` / `重复` / `already exist` / `duplicate` …), a `CD2_TOKEN` hint for auth
+failures, a "not supported" reply, or `None` when unclassified.
+
+Rules:
+- **`INTERNAL` is not a connection problem.** Only `UNAVAILABLE` / `DEADLINE_EXCEEDED`
+  (`_TRANSPORT_STATUS_CODES`, with `_TRANSPORT_TEXT_HINTS` as fallback for non-gRPC
+  exceptions) justify telling the user `CD2 连接异常`. Everything else says `提交失败`.
+- **Never expose `AioRpcError`.** Its `str()` is a 4-line repr whose `debug_error_string`
+  duplicates `details`. Always go through `_grpc_error_raw()` (prefers `details()`) and
+  `_shorten()` (single-line + truncate to `_REJECT_TEXT_LIMIT`).
+- The raw error must always stay in the log (`logger.exception` / `logger.warning`) —
+  simplification applies to the Telegram reply only.
+- Adding a category means adding keywords to the hint tuples and a test in
+  `tests/test_reject_message_format.py` (plus an end-to-end case in
+  `tests/test_submit_error_attribution.py` when the new path is submit-related).
 
 ### Telegram Bot v22+ Proxy Configuration
 Both `request` and `get_updates_request` must be configured with proxy:
@@ -176,10 +189,46 @@ all_dirs.sort(key=lambda x: x.fullPathName.count('/'), reverse=True)
 
 6. **Cleanup Logic**: Files are deleted per-file, not per-folder. SIZE_THRESHOLD applies to each file individually. Blacklist only applies to files >= SIZE_THRESHOLD.
 
+## Branch & Versioning Convention (dev → master)
+
+Development happens on the **`dev`** branch; production releases happen on **`master`**. The two
+environments are isolated purely by **image tags**, so a busy dev branch never forces a production
+version bump.
+
+| Branch | `__version__` in `main.py` | Image tags built automatically | GitHub Release |
+| --- | --- | --- | --- |
+| `dev` | `1.1.10-1`, `1.1.10-2`, … (prod version + 1, with `-n` suffix) | `dev-latest`, `dev-1.1.10-1` | never |
+| `master` + `v*` tag | `1.1.10` (drop the `-n`) | `1.1.10`, `latest` | yes |
+
+Hard rules:
+- **`latest` is written only by a `v*` tag build. dev pushes must never touch it** — the tag
+  rules in `docker-publish.yml` gate each entry with `enable=` for exactly this reason.
+- The CI reads `__version__` straight out of `main.py` (`sed` on the
+  `__version__ = "x.y.z"` line) and feeds it into the dev image tag. **That line must keep its
+  exact format** — the workflow fails fast with `::error::` if it cannot be parsed.
+- `workflow_dispatch` builds `manual-<version>` so a manual run is reproducible and still cannot
+  overwrite `latest`.
+- Concurrency cancels superseded builds per ref, except for `v*` tag builds, which are never
+  cancelled.
+
+Promoting to production:
+1. `git switch master && git pull && git merge --no-ff dev`
+2. Rewrite `main.py` `__version__` to the plain release version (`1.1.10-2` → `1.1.10`) and sync
+   `README.md` (version line + changelog).
+3. `git commit && git push origin master`, then `git tag v1.1.10 && git push origin v1.1.10`.
+4. Back on `dev`, bump the base to the next pre-release line (`1.1.11-1`) so the two branches
+   cannot collide.
+
 ## Release Process
 
-1. Update version in `main.py` (`__version__`) and `README.md` — these are **informational only** and kept in sync by hand.
+1. Update version in `main.py` (`__version__`) and `README.md` — these are kept in sync by hand.
+   On `dev` the value carries a `-n` suffix; the release itself uses the plain version.
 2. Create and push a version tag: `git tag v1.x.x && git push origin v1.x.x`
-3. `.github/workflows/docker-publish.yml` triggers on `v*` tags (or manual `workflow_dispatch`) and pushes to `ghcr.io/<owner>/cd2_magnet_tgbot` (i.e. `ghcr.io/ymting/...`), tagging both the **semver from the git tag** and `latest`.
+3. `.github/workflows/docker-publish.yml` triggers on `v*` tags, on pushes to `dev`, and on manual
+   `workflow_dispatch`, pushing to `ghcr.io/<owner>/cd2_magnet_tgbot` (i.e. `ghcr.io/ymting/...`).
+   Tag pushes produce the **semver from the git tag** plus `latest`; dev pushes produce
+   `dev-latest` plus `dev-<__version__>`.
 
-The published image version comes from the **git tag**, not from `__version__` — the git tag is the source of truth.
+The published **production** image version comes from the **git tag**, not from `__version__` —
+the git tag is the source of truth there. The dev image version comes from `__version__`, which is
+why the two must stay consistent.

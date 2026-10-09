@@ -1,9 +1,53 @@
 # CloudDrive2 Telegram 下载管理器
 
-**版本: 1.1.9**
+**版本: 1.1.10-1 (dev 预发布)**
 
 项目简介：
 这是一个专为 CloudDrive2 (CD2) 开发的 Telegram 机器人助手。它能够接收磁力链接、HTTP 链接及 ed2k 链接，并自动提交至 CD2 执行离线下载，同时提供强大的自动化后期清理功能。
+
+---
+
+## 🌿 分支与版本约定
+
+开发迭代在 `dev` 分支进行，生产发布在 `master` 分支，两者用**镜像标签完全隔离**。
+
+| 分支 | 版本号（`main.py` 的 `__version__`） | 推送后自动构建的镜像标签 | GitHub Release |
+| --- | --- | --- | --- |
+| `dev` | `1.1.10-1`、`1.1.10-2` ……（比生产版本 +1 并带 `-n`） | `dev-latest`、`dev-1.1.10-1` | 不创建 |
+| `master`（推 `v*` tag） | `1.1.10`（去掉 `-n`） | `1.1.10`、`latest` | 自动创建 |
+
+**为什么这么设计**：dev 上一天改十次也只产生 `dev-*` 镜像，生产环境不会被高频版本号追着升级；等一批改动稳定后，一次性同步到 `master` 并发一个正式版本。
+
+### 开发迭代流程（dev）
+
+```bash
+git switch dev
+git pull
+# ...改代码...
+# 1) 把 main.py 的 __version__ 递增：1.1.10-1 → 1.1.10-2
+# 2) 同步 README 顶部版本行
+git commit -am "fix: xxx"
+git push origin dev
+```
+
+推送后 CI 自动构建 `ghcr.io/ymting/cd2_magnet_tgbot:dev-latest` 与 `:dev-1.1.10-2`，**不会碰 `latest`，也不会创建 Release**。
+
+想测试这一版，把测试机的 compose 镜像改成 `:dev-latest`（或钉死 `:dev-1.1.10-2`）即可。
+
+### 生产发版流程（master）
+
+```bash
+git switch master
+git pull
+git merge --no-ff dev            # 从 dev 同步代码（可能需解决冲突）
+# 1) 把 main.py 的 __version__ 改为正式版：1.1.10-2 → 1.1.10
+# 2) 同步 README 版本行 + 更新日志
+git commit -am "release: v1.1.10"
+git push origin master
+git tag v1.1.10 && git push origin v1.1.10   # 触发正式镜像 + Release
+```
+
+发版后回到 `dev`，把版本号推进到下一个预发布位（`1.1.10` → `1.1.11-1`），避免两边版本号撞车。
 
 ---
 
@@ -77,6 +121,22 @@ services:
 ---
 
 ## 🛠️ 更新日志
+
+### v1.1.10-1 (dev 预发布，未发生产)
+* **修复 v1.1.9 漏掉的路径**：重复提交链接时仍会看到一大段技术报错，形如
+  `❌ 提交失败，CD2 连接异常: AioRpcError: <AioRpcError of RPC that terminated with: status = StatusCode.INTERNAL
+  details = "api error Cloud 115open(5975675)… code: 10008, message: 任务已存在，请勿输入重复的链接地址" …>`。
+  原因是云盘的业务拒绝其实有**两条到达路径**：v1.1.9 只处理了 `success=false + errorMessage`，
+  而 115open 对重复链接返回的是 **gRPC 异常**（`StatusCode.INTERNAL` + `code 10008`）。本版把异常路径一并归类，
+  现在同样只显示「⚠️ 这个链接之前已经提交过了，无需重复提交。」
+* **不再把业务拒绝误报成「连接异常」**：只有 `UNAVAILABLE` / `DEADLINE_EXCEEDED` 这类真正的传输层故障才说「CD2 连接异常」，
+  `INTERNAL` 属于云盘 API 业务错误，如实说「提交失败」。
+* **用户消息里不再出现多行 repr**：`AioRpcError` 的 `details` 与 `debug_error_string` 本就是同一份内容，
+  现在只取 `details()` 并压成单行 + 截断，消息里不会再出现 4 行堆栈样式的内容。
+* **顺带修掉同类问题**：`/clean` 的失败回执与单目录清理异常原本也会把 `AioRpcError` 整段原文塞进 Telegram，
+  现已统一压成一行摘要（清理失败回执同时去掉 Markdown 解析，避免异常文本里的特殊字符导致发送再失败）。
+* **新增 dev 分支构建流水线**：推 `dev` 分支会自动构建 `dev-latest` 与 `dev-<版本号>` 镜像，**不触碰 `latest`、不创建 Release**；
+  版本号由 CI 直接从 `main.py` 的 `__version__` 读取，避免 tag 名与代码版本号两处手写不一致。详见上方「分支与版本约定」。
 
 ### v1.1.9 (2026-10-09)
 * **提示文案口语化**：重复提交同一个链接时，之前机器人会把 CloudDrive2 返回的原始错误（面向开发者的技术描述，可能夹带云盘 API 原文和错误码）原样甩出来，比如「❌ CD2 拒绝请求: 添加离线下载任务失败: …」。现在改为归类成一句人话：**「⚠️ 这个链接之前已经提交过了，无需重复提交。」**

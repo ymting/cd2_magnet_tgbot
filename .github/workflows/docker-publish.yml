@@ -2,12 +2,18 @@ name: 构建并推送 Docker 镜像
 
 on:
   push:
-    tags: [ "v*" ]  # 只在发布 tag 时构建镜像
-  workflow_dispatch:
+    tags: [ "v*" ]        # 生产发版：推 v* tag
+    branches: [ "dev" ]   # 开发迭代：推 dev 分支
+  workflow_dispatch:      # 手动重跑（不会污染 latest）
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+
+# 同一个 ref 上只有最后一次构建有意义，但生产 tag 的构建绝不能被后续提交取消
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') }}
 
 jobs:
   build:
@@ -22,6 +28,21 @@ jobs:
       - name: 拉取项目代码 (Checkout repository)
         uses: actions/checkout@v4
 
+      # 版本号只有一个来源：main.py 的 __version__。
+      # 生产为 1.1.10，dev 为 1.1.10-1 / 1.1.10-2 …… 由这里读出来喂给镜像标签，
+      # 避免「tag 名」与「代码里的版本号」两处手写不一致。
+      - name: 读取版本号 (Read __version__)
+        id: version
+        run: |
+          set -euo pipefail
+          VERSION=$(sed -n 's/^__version__ *= *"\(.*\)" *$/\1/p' main.py | head -n1)
+          if [ -z "$VERSION" ]; then
+            echo "::error::未能从 main.py 解析出 __version__，请检查该行格式是否为 __version__ = \"x.y.z\""
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "解析到版本号: $VERSION"
+
       - name: 登录到容器镜像中心 (Log in to the Container registry)
         uses: docker/login-action@v3
         with:
@@ -29,16 +50,21 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # 镜像标签规则 —— 生产与 dev 严格隔离，dev 永不触碰 latest：
+      #   生产 v* tag → <版本号> + latest         例: 1.1.10 / latest
+      #   dev 分支    → dev-latest + dev-<版本号> 例: dev-latest / dev-1.1.10-1
+      #   手动触发    → manual-<版本号>（可复现，不污染 latest）
       - name: 提取 Docker 标签 (Extract Docker tags)
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            # 版本号标签 (如 1.1.3)
-            type=semver,pattern={{version}}
-            # latest 标签始终指向最新发布的版本
-            type=raw,value=latest
+            type=semver,pattern={{version}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=dev-latest,enable=${{ github.ref == 'refs/heads/dev' }}
+            type=raw,value=dev-${{ steps.version.outputs.version }},enable=${{ github.ref == 'refs/heads/dev' }}
+            type=raw,value=manual-${{ steps.version.outputs.version }},enable=${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/dev' }}
 
       - name: 构建并推送到 GHCR (Build and push Docker image)
         uses: docker/build-push-action@v5
@@ -50,7 +76,7 @@ jobs:
 
       # 发布 GitHub Release。
       # 说明：push tag 只会产生 git tag，不会出现在仓库的 Releases 页面，
-      # 必须显式创建 Release。仅在 tag 触发时执行，避免 workflow_dispatch 误发。
+      # 必须显式创建 Release。仅在 tag 触发时执行，避免 dev 分支与手动触发误发。
       - name: 创建 GitHub Release (Create GitHub Release)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
