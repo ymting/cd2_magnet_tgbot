@@ -36,18 +36,24 @@ python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. clouddrive.pr
 Unit tests live in `tests/` and need no network access:
 
 ```bash
-python -m unittest tests.test_polling_watchdog tests.test_network_error_handling
+python -m unittest tests.test_network_error_handling tests.test_polling_watchdog \
+  tests.test_token_redaction tests.test_reject_message_format \
+  tests.test_submit_error_attribution tests.test_batch_links
 ```
+> `unittest discover -s tests` fails with "Start directory is not importable" because `tests/` has no
+> `__init__.py` — list the modules explicitly.
+> When working in the repo's own virtualenv on Windows, run them as
+> `.venv/Scripts/python.exe -m unittest ...`.
 
 Integration behavior still requires `python main.py` against a live CloudDrive2 instance (or watching `docker-compose` logs).
 
 ## Architecture
 
 ### Single-File Design
-All business logic resides in `main.py` (~580 lines; version string in `__version__`). The code is organized into 4 commented sections (referenced by function name since line numbers drift):
+All business logic resides in `main.py` (~910 lines; version string in `__version__`). The code is organized into 4 commented sections (referenced by function name since line numbers drift):
 1. **Variable Configuration**: env vars → module constants (note the renames, see Environment Variables below)
 2. **Core Cleanup Logic**: `get_blacklist()`, `get_all_items_recursive()`, `is_directory_empty()`, `clean_task_folder()`, `run_auto_clean()`
-3. **Telegram Handlers**: `error_handler()`, `_get_polling_task()`, `watchdog_check()`, `_mask_link()`, `_shorten()`, `_grpc_error_raw()`, `_is_transport_failure()`, `_classify_reject_reason()`, `_friendly_reject_reason()`, `_describe_submit_failure()`, `_safe_send()`, `handle_link()`, `cmd_clean()`, `cmd_blacklist()`, `post_init()`
+3. **Telegram Handlers**: `error_handler()`, `_get_polling_task()`, `watchdog_check()`, `_mask_link()`, `_extract_links()`, `_shorten()`, `_grpc_error_raw()`, `_is_transport_failure()`, `_classify_reject_reason()`, `_friendly_reject_reason()`, `_describe_submit_failure()`, `_safe_send()`, `SubmitOutcome`, `_submit_offline_link()`, `_build_batch_report()`, `_reply_single_link()`, `_submit_batch_links()`, `handle_link()`, `cmd_clean()`, `cmd_blacklist()`, `post_init()`
 4. **Entry Point** (`__main__`): proxy/`HTTPXRequest` setup, `ApplicationBuilder` wiring, `run_polling()`
 
 ### Key Components
@@ -111,6 +117,37 @@ Rules:
 - Adding a category means adding keywords to the hint tuples and a test in
   `tests/test_reject_message_format.py` (plus an end-to-end case in
   `tests/test_submit_error_attribution.py` when the new path is submit-related).
+
+### Batch Links (v1.1.10-5+)
+A single message may carry **several links of mixed schemes** (magnet / ed2k / http(s)).
+
+- `_extract_links(text)` regex-scans the whole message body instead of checking
+  `text.startswith(...)`. The old prefix check silently dropped numbered lists
+  (`1. magnet:... 2. ed2k://...`) — a real bug: nothing was submitted at all.
+  It also deduplicates, lowercases the scheme only (never the rest of the URL, or magnet
+  `dn=` payloads would change), and strips trailing punctuation.
+- The regex stops at **CJK punctuation but not at CJK ideographs** — ed2k filenames are
+  commonly unencoded Chinese (`ed2k://|file|某部电影.avi|...`), so breaking on Han characters
+  would truncate the link. ASCII `)`/`]`/`}` are intentionally kept so URLs such as
+  `https://zh.wikipedia.org/wiki/Foo_(bar)` survive intact.
+- **Newline-separated lists need no special handling** — `\s` already covers LF, CRLF, tabs and
+  the ideographic space, so "one link per line" (the main way people paste) just works.
+- Tail cleaning is two layers, in this order: `_LINK_TRAILING_CHARS` (punctuation) then
+  `_WRAPPER_PAIRS` (paired wrappers `` ` `` `[ ]` `( )` `{ }`), looped until stable because they
+  stack (`[link]。`). A wrapper is only stripped when its opener is **absent** from the link body —
+  that single rule is what keeps `Foo_(bar)` and `[::1]` intact while cleaning `[magnet:...]`.
+  See `LinkPasteFormatTests` before touching it.
+- Zero-width characters (`_INVISIBLE_CHARS`) are deleted as noise, never treated as separators —
+  treating them as separators would split a link in half.
+- **Each link is submitted in its own `AddOfflineFiles` call** (one shared channel/stub for
+  the whole batch), so success/failure is attributable per link and one rejection cannot
+  abort the rest. Do not "optimize" this back into one joined `urls` string.
+- Results go through `_build_batch_report()` as **plain text, no `parse_mode`** — link text
+  contains `_`, `*`, `[` which break legacy Markdown, and a parse failure would cost the
+  whole report. The report is also truncated below `_BATCH_REPORT_LIMIT` (3500) because
+  Telegram caps messages at 4096 and an over-long send fails with a non-retryable BadRequest.
+- `_safe_send()` returns the send result (normalized to a truthy value) instead of a bare
+  `True`, so the batch path can `edit_text()` the progress message into the final report.
 
 ### Telegram Bot v22+ Proxy Configuration
 Both `request` and `get_updates_request` must be configured with proxy:
@@ -185,7 +222,7 @@ all_dirs.sort(key=lambda x: x.fullPathName.count('/'), reverse=True)
 
 4. **Permission Control**: All handlers must check `update.effective_user.id in ADMIN_IDS` at the beginning.
 
-5. **Error Handling**: The `error_handler` tracks network retry count and stops the application when `MAX_RETRIES` is exceeded. Non-network errors reset the counter.
+5. **Error Handling**: Network errors are only counted and logged (windowed by `NETWORK_ERROR_RESET_SECONDS`); they never stop the application anymore (v1.1.5+). Liveness is guarded by the polling watchdog instead. Non-network errors are logged on their own.
 
 6. **Cleanup Logic**: Files are deleted per-file, not per-folder. SIZE_THRESHOLD applies to each file individually. Blacklist only applies to files >= SIZE_THRESHOLD.
 

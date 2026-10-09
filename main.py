@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 项目名称: CloudDrive2 Telegram 离线下载管家
-版本: 1.1.10-4 (dev 预发布；生产发版时改为 1.1.10)
+版本: 1.1.10-5 (dev 预发布；生产发版时改为 1.1.10)
 功能描述:
     1. 链接监听: 自动识别 Magnet、HTTP、ed2k 链接并提交至 CD2 离线下载。
+       支持一条消息里混合粘贴多个不同类型的链接，逐个提交后汇总回执。
     2. 定时清理: 基于 Cron 表达式，递归扫描下载目录，删除小文件和黑名单文件，清理空目录。
     3. 异常容错: 增加全局错误处理与 gRPC 超时控制，防止网络波动导致假死。
     4. 轮询看门狗: 周期检测 Telegram 轮询协程是否已死亡，避免「容器活着但收不到消息」的永久静默。
@@ -22,11 +23,12 @@ import asyncio
 import clouddrive_pb2
 import clouddrive_pb2_grpc
 from datetime import datetime
+from typing import NamedTuple
 
 # 版本号
 # 版本号。唯一来源：CI 直接从这里读取并生成镜像标签（见 docker-publish.yml）。
 # 约定：master 上是生产版本（如 1.1.10），dev 分支上带 -n 后缀（如 1.1.10-1、1.1.10-2）。
-__version__ = "1.1.10-4"
+__version__ = "1.1.10-5"
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from telegram import Update, BotCommand
@@ -352,6 +354,111 @@ def _mask_link(link: str, limit: int = 80) -> str:
 
 
 # ---------------------------------------------------------------------------
+# 链接解析：一条消息里可能同时出现多个不同类型的链接
+# ---------------------------------------------------------------------------
+# CD2 的 AddOfflineFiles 接受 magnet / ed2k / http(s)，这里用同一套正则把消息正文里的
+# 链接全部抠出来 —— 不再要求整条消息以链接开头，因此
+# 「1. magnet:... 2. ed2k://... 3. https://...」这类带序号或项目符号的列表也能识别。
+# （旧实现用 startswith 判断，遇到序号前缀会整条消息被丢弃，一个都提交不了。）
+
+# 中文标点。它们永远不会出现在链接里，却常常紧跟链接出现（「链接：magnet:...。还有 ed2k://...」），
+# 必须在这里就截断匹配，否则会把后面的正文一起吞进链接。
+# 注意只截断「标点」而不截断汉字：ed2k 的 |file| 文件名段经常直接写中文（未做 URL 编码），
+# 若在汉字处断开会把链接截断成失效的半截。
+_CJK_PUNCTUATION = "，。、；：！？（）【】《》「」『』“”‘’—…～·"
+
+# 协议名大小写不敏感（用户可能粘贴成 Magnet: / HTTPS://）。
+_LINK_PATTERN = re.compile(
+    rf"(?:magnet:|ed2k://|https?://)[^\s<>\"'{_CJK_PUNCTUATION}]+",
+    re.IGNORECASE,
+)
+
+# 从聊天里复制链接时末尾常粘上标点，需要从链接尾部剥掉。
+# 刻意不含 ASCII 的 ) ] } —— 它们可能是 URL 本身的组成部分（如维基百科条目名 Foo_(bar)）。
+_LINK_TRAILING_CHARS = "，。、；：！？…）】》」』”’.,;:!?"
+
+# 成对包裹符号。链接被 `\``、`[ ]`、`( )` 包住时（从网页或 Markdown 里复制很常见），
+# 末尾会粘上闭合符号。判断依据：只有当链接主体里**没有**对应的开启符号时，
+# 才认定它是「包裹」而不是 URL 自身的结构 ——
+# 这样既剥得掉 [magnet:...] 的 ]，又不会误伤 https://.../Foo_(bar) 和 http://[::1]:8080 的 ) ]。
+_WRAPPER_PAIRS = {")": "(", "]": "[", "}": "{", "`": "`"}
+
+# 零宽字符：从网页 / App 复制时会被夹带进来，肉眼不可见但会让 CD2 判定链接非法。
+# 它们不是分隔符（不能用来断句），而是噪音，按「直接删除」处理。
+_INVISIBLE_CHARS = str.maketrans("", "", "\u200b\u200c\u200d\u2060\ufeff")
+
+# 去掉协议头后至少还要有这么多字符才算一个「像样的」链接，
+# 用来挡掉正文里出现的裸 "https://" 之类的碎片。
+_LINK_MIN_BODY_CHARS = 3
+
+# 单个链接在批量报告里回显的最大长度（复用 _mask_link 的截断格式）
+_BATCH_LINK_LABEL_LIMIT = 40
+
+# 批量报告的整体长度上限。Telegram 单条消息上限 4096 字符，超限会抛 BadRequest，
+# 而 BadRequest 属于非网络异常（_safe_send 不重试）→ 用户最终什么都收不到。
+# 所以这里主动截断成「只展示前 N 条」，而不是把整份报告发出去撞墙。
+_BATCH_REPORT_LIMIT = 3500
+
+
+def _clean_link_tail(link: str, scheme_end: int) -> str:
+    """剥掉链接尾部粘上的标点与成对包裹符号。
+
+    两种情况会叠加（例如 `[magnet:...]。`：先掉句号，再掉方括号），
+    因此循环到不再变化为止。
+    """
+    while True:
+        cleaned = link.rstrip(_LINK_TRAILING_CHARS)
+        while len(cleaned) - scheme_end > 1:
+            closer = cleaned[-1]
+            opener = _WRAPPER_PAIRS.get(closer)
+            if opener is None:
+                break
+            # 末尾可能叠着多个同种闭合符号（三反引号代码块紧贴链接时会这样）
+            run = len(cleaned) - len(cleaned.rstrip(closer))
+            if closer == opener:
+                # 同字符配对（反引号）：奇数个里必然有一个是孤立的，整段剥掉
+                if run % 2 == 0:
+                    break
+            elif opener in cleaned[scheme_end:-run]:
+                # 不同字符配对：主体里已有开启符号 → 属于 URL 自身结构（Foo_(bar) / [::1]）
+                break
+            cleaned = cleaned[:-run]
+        if cleaned == link:
+            return cleaned
+        link = cleaned
+
+
+def _extract_links(text: str | None) -> list[str]:
+    """从消息正文里提取所有链接，按出现顺序返回，并去掉完全重复的条目。
+
+    链接之间用换行、空格、制表符还是全角空格分隔都能识别 —— 正则按空白切分，
+    所以「一行一个链接」这种最常见的粘贴方式天然被覆盖。
+    一行里的链接也不会互相污染：匹配到 URL 后又遇到下一个协议名时，
+    前一个链接已经在标点/空白处结束。
+
+    为什么要去重：同一条消息里重复粘贴同一个链接时，逐个提交必然全部被 CD2 判为重复，
+    真正有价值的信息是「其它链接有没有提交成功」，没必要让重复项占满报告。
+    """
+    links: list[str] = []
+    seen: set[str] = set()
+
+    for match in _LINK_PATTERN.finditer(text or ""):
+        raw = match.group(0)
+        # 协议名统一小写（用户可能手打成 Magnet: / HTTPS://），其后的内容原样保留 ——
+        # 对整串 lower() 会改掉 magnet 里 dn 显示名等参数的大小写。
+        scheme_end = raw.index(":") + 1
+        link = (raw[:scheme_end].lower() + raw[scheme_end:]).translate(_INVISIBLE_CHARS)
+        link = _clean_link_tail(link, scheme_end)
+
+        if len(link) - scheme_end < _LINK_MIN_BODY_CHARS or link in seen:
+            continue
+        seen.add(link)
+        links.append(link)
+
+    return links
+
+
+# ---------------------------------------------------------------------------
 # 失败原因「人话化」文案
 # ---------------------------------------------------------------------------
 # 为什么需要这一层：
@@ -507,7 +614,7 @@ def _describe_submit_failure(error: BaseException) -> str:
     return f"❌ 提交失败（{type(error).__name__}）：{_shorten(raw)}"
 
 
-async def _safe_send(send_func, text: str, description: str, **kwargs) -> bool:
+async def _safe_send(send_func, text: str, description: str, **kwargs):
     """发送/编辑 Telegram 消息，遇到瞬时网络故障自动重试，且失败必留日志。
 
     为什么要单独抽出来：
@@ -516,21 +623,25 @@ async def _safe_send(send_func, text: str, description: str, **kwargs) -> bool:
         「❌ 提交失败，CD2 连接异常」—— 云盘里任务其实跑得好好的，用户却被误导，
         而日志里连一行记录都没有，完全无法排查。
 
-    返回 True 表示消息最终送达。调用方必须根据返回值决定后续动作，
-    不要用「发送失败」去否定已经完成的业务动作。
+    返回值：成功时返回发送结果对象（Message / True），失败返回 None。
+        布尔语义与旧版一致（非 None 即送达），但需要拿到消息对象的调用方
+        （例如批量提交要先把进度消息 edit 成最终报告）可以直接使用返回值。
+        调用方必须根据返回值决定后续动作，不要用「发送失败」去否定已完成的业务动作。
     """
     last_error: Exception | None = None
 
     for attempt in range(1, REPLY_MAX_ATTEMPTS + 1):
         try:
-            await send_func(text, **kwargs)
-            return True
+            result = await send_func(text, **kwargs)
+            # 统一成「成功必返回真值」：PTB 正常会返回 Message，但个别接口/替身可能返回 None，
+            # 若原样透传，调用方的 `if not await _safe_send(...)` 会把成功误判成失败。
+            return result if result is not None else True
         except Exception as e:
             last_error = e
             # 非网络异常(例如 Markdown 解析失败、消息过长)重试没有意义，立刻放弃
             if not _is_network_error(e):
                 logger.error("❌ 【%s】发送失败(非网络异常，不重试): %s", description, e, exc_info=True)
-                return False
+                return None
 
             if attempt < REPLY_MAX_ATTEMPTS:
                 logger.warning(
@@ -550,58 +661,161 @@ async def _safe_send(send_func, text: str, description: str, **kwargs) -> bool:
         last_error,
         exc_info=last_error,
     )
-    return False
+    return None
 
 
-async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """监听并处理发送的磁力链接、HTTP、电驴链接"""
-    if update.effective_user.id not in ADMIN_IDS: return
-    text = update.message.text.strip()
+class SubmitOutcome(NamedTuple):
+    """单个链接的提交结果。
 
-    if not any(text.startswith(p) for p in ["magnet:", "http", "ed2k://"]):
-        return
+    ok:          是否提交成功；
+    message:     面向用户的一句话（失败时已归类成人话，不含技术性原文）；
+    description: 回执日志里的用途标签，用于在日志中区分是哪一类回执。
+    """
 
-    # ---------- 阶段一：提交到 CD2 ----------
-    # 这里的 except 只兜 gRPC 提交，日志必须留全（含堆栈）；
-    # 但用户侧只说人话 —— 云盘的业务拒绝（如 115open 的「任务已存在」）
-    # 也是以 gRPC 异常抛出的，直接展示 AioRpcError 的 4 行 repr 毫无意义。
+    ok: bool
+    message: str
+    description: str
+
+
+async def _submit_offline_link(stub, metadata, link: str) -> SubmitOutcome:
+    """把单个链接提交到 CD2 离线下载，返回可展示给用户的结果。
+
+    这里只负责「提交」，不负责回执 —— 回执由调用方走 _safe_send，
+    遵守「提交与回执分开归因」的约定，避免回执失败被误报成 CD2 故障。
+
+    批量提交时所有链接共用同一个 stub，避免为每个链接重复建连。
+    """
+    try:
+        req = clouddrive_pb2.AddOfflineFileRequest(urls=link, toFolder=SAVE_PATH)
+        res = await stub.AddOfflineFiles(req, metadata=metadata, timeout=15)
+    except Exception as e:
+        # 日志留全；用户侧只说人话 —— 云盘的业务拒绝(如 115open 的「任务已存在」)
+        # 也是以 gRPC 异常抛出的，直接展示 AioRpcError 的 4 行 repr 毫无意义。
+        logger.exception("❌ 提交 CD2 离线下载失败 [%s]: %s", type(e).__name__, _mask_link(link))
+        return SubmitOutcome(False, _describe_submit_failure(e), "CD2 提交失败回执")
+
+    if not res.success:
+        # 原始 errorMessage 只进日志：它是面向开发者的描述，原样转发给用户既看不懂也容易吓人。
+        logger.warning("⚠️ CD2 拒绝离线下载请求: %s | 链接: %s", res.errorMessage, _mask_link(link))
+        return SubmitOutcome(False, _friendly_reject_reason(res.errorMessage), "CD2 拒绝回执")
+
+    logger.info("✅ 已提交离线下载: %s", _mask_link(link))
+    return SubmitOutcome(True, "✅ 提交成功", "提交成功回执")
+
+
+def _build_batch_report(results: list[tuple[str, SubmitOutcome]]) -> str:
+    """把逐条提交结果拼成一份纯文本报告。
+
+    刻意不使用 Markdown：报告里要回显链接原文，而链接中的 `_` `*` `[` 会破坏
+    Telegram 的 Markdown 解析，导致整条报告发送失败（项目历史上踩过同类坑）。
+    纯文本没有这个问题，也就不需要转义。
+    """
+    total = len(results)
+    success = sum(1 for _, outcome in results if outcome.ok)
+    lines = [
+        f"📊 批量提交完成：成功 {success} / 失败 {total - success}（共 {total} 个链接）",
+        f"📂 目录：{SAVE_PATH}",
+        "",
+    ]
+
+    shown = 0
+    for index, (link, outcome) in enumerate(results, 1):
+        line = f"{index}. {'✅' if outcome.ok else '❌'} {_mask_link(link, _BATCH_LINK_LABEL_LIMIT)}"
+        if not outcome.ok:
+            # 失败才附带原因；文案已经过归类，不会出现技术性原文
+            line += f"\n      ↳ {outcome.message}"
+        if len("\n".join(lines + [line])) > _BATCH_REPORT_LIMIT:
+            break
+        lines.append(line)
+        shown = index
+
+    omitted = total - shown
+    if omitted:
+        lines.append(f"…（其余 {omitted} 条结果因消息过长已省略，完整记录见容器日志）")
+    else:
+        lines.extend(["", "提示：完成后发送 /clean 执行清理。"])
+    return "\n".join(lines)
+
+
+async def _reply_single_link(update: Update, link: str) -> None:
+    """单链接路径：保持原有的回执文案（成功时带目录与 /clean 提示）。"""
     try:
         async with grpc.aio.insecure_channel(CD2_IP_PORT) as channel:
             stub = clouddrive_pb2_grpc.CloudDriveFileSrvStub(channel)
             metadata = [('authorization', f'Bearer {CD2_TOKEN}')]
-            req = clouddrive_pb2.AddOfflineFileRequest(urls=text, toFolder=SAVE_PATH)
-            res = await stub.AddOfflineFiles(req, metadata=metadata, timeout=15)
+            outcome = await _submit_offline_link(stub, metadata, link)
     except Exception as e:
-        logger.exception("❌ 提交 CD2 离线下载失败 [%s]: %s", type(e).__name__, _mask_link(text))
-        await _safe_send(
-            update.message.reply_text,
-            _describe_submit_failure(e),
-            description="CD2 提交失败回执",
-        )
+        # 建连阶段就失败（例如 CD2_ADDRESS 填错导致地址非法），此时单条归类无从产生
+        logger.exception("❌ 提交 CD2 离线下载失败 [%s]: %s", type(e).__name__, _mask_link(link))
+        outcome = SubmitOutcome(False, _describe_submit_failure(e), "CD2 提交失败回执")
+
+    if not outcome.ok:
+        await _safe_send(update.message.reply_text, outcome.message, description=outcome.description)
         return
 
-    if not res.success:
-        # 原始 errorMessage 只进日志：它是面向开发者的描述，原样转发给用户既看不懂也容易吓人。
-        # 用户侧统一走 _friendly_reject_reason 归类后的简短提示。
-        logger.warning("⚠️ CD2 拒绝离线下载请求: %s | 链接: %s", res.errorMessage, _mask_link(text))
-        await _safe_send(
-            update.message.reply_text,
-            _friendly_reject_reason(res.errorMessage),
-            description="CD2 拒绝回执",
-        )
-        return
-
-    # ---------- 阶段二：回执 ----------
     # 走到这里说明任务已经在 CD2 上跑起来了。
     # 后续回执发不出去只能记日志，绝不能反过来告诉用户「提交失败」。
-    logger.info("✅ 已提交离线下载: %s", _mask_link(text))
     delivered = await _safe_send(
         update.message.reply_text,
         f"✅ 提交成功！\n📂 目录：`{SAVE_PATH}`\n提示：完成后发送 /clean 执行清理。",
         description="提交成功回执",
     )
     if not delivered:
-        logger.error("❗ 任务已在 CD2 提交成功，但成功回执未能送达用户，链接: %s", _mask_link(text))
+        logger.error("❗ 任务已在 CD2 提交成功，但成功回执未能送达用户，链接: %s", _mask_link(link))
+
+
+async def _submit_batch_links(update: Update, links: list[str]) -> None:
+    """批量路径：先回一条进度提示，再逐个提交，最后把结果汇总编辑进同一条消息。"""
+    # 批量提交要逐个走 gRPC，先给用户一个「已收到」的确认，避免看着像没反应
+    status_msg = await _safe_send(
+        update.message.reply_text,
+        f"📥 收到 {len(links)} 个链接，正在逐个提交，请稍候…",
+        description="批量提交进度回执",
+    )
+
+    results: list[tuple[str, SubmitOutcome]] = []
+    try:
+        async with grpc.aio.insecure_channel(CD2_IP_PORT) as channel:
+            stub = clouddrive_pb2_grpc.CloudDriveFileSrvStub(channel)
+            metadata = [('authorization', f'Bearer {CD2_TOKEN}')]
+            for link in links:
+                results.append((link, await _submit_offline_link(stub, metadata, link)))
+    except Exception as e:
+        # 只有建连/通道层面的异常会走到这里（单条提交的异常已在 _submit_offline_link 内部归类）。
+        # 已提交的链接结果必须保留，未轮到的按同一条原因批量标注，不能整批丢弃。
+        logger.exception("❌ 批量提交提前中断 [%s]", type(e).__name__)
+        reason = _describe_submit_failure(e)
+        results.extend(
+            (link, SubmitOutcome(False, reason, "批量提交中断回执"))
+            for link in links[len(results):]
+        )
+
+    report = _build_batch_report(results)
+    # 优先把进度消息改成结果，避免聊天里留一条永远「正在提交…」的提示
+    if status_msg is not None:
+        if await _safe_send(status_msg.edit_text, report, description="批量提交报告"):
+            return
+        logger.warning("⚠️ 批量报告编辑失败，改为新消息重发")
+    await _safe_send(update.message.reply_text, report, description="批量提交报告(新消息)")
+
+
+async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """监听并处理消息中的下载链接。
+
+    支持一条消息里混合出现多个不同类型的链接（magnet / ed2k / http(s)）：
+    逐个提交后汇总成一份报告；只有一个链接时沿用原有的单条回执文案。
+    """
+    if update.effective_user.id not in ADMIN_IDS: return
+
+    links = _extract_links(update.message.text)
+    if not links:
+        return
+
+    if len(links) == 1:
+        await _reply_single_link(update, links[0])
+        return
+
+    await _submit_batch_links(update, links)
 
 
 async def cmd_clean(update: Update, context: ContextTypes.DEFAULT_TYPE):

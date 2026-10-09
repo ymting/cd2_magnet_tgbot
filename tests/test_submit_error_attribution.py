@@ -252,6 +252,12 @@ class SafeSendTests(unittest.TestCase):
         self.assertFalse(result)
         self.assertEqual(send.await_count, main.REPLY_MAX_ATTEMPTS)
 
+    def test_send_result_is_returned_to_caller(self):
+        """批量提交需要拿到消息对象才能把进度消息 edit 成最终报告，返回值必须透传。"""
+        message = object()
+        send = AsyncMock(return_value=message)
+        self.assertIs(asyncio.run(main._safe_send(send, "hello", description="测试消息")), message)
+
 
 class MaskLinkTests(unittest.TestCase):
     def test_short_link_is_kept(self):
