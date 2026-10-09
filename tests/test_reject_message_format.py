@@ -137,5 +137,90 @@ class SubmitFailureDescriptionTests(unittest.TestCase):
         self.assertFalse(main._is_transport_failure(Exception("api error: bad request")))
 
 
+class HttpDirectLinkFailureTests(unittest.TestCase):
+    """http(s) 直链提交失败时，必须给出指导性文案，而不是笼统的「不支持这个链接」。
+
+    背景（2026-10-09）：README 曾承诺「支持 http://、https:// 离线下载」，
+    但 CD2 的离线下载由**后端网盘**执行，115open 之类通常只吃磁力 / ed2k，
+    直链基本会被拒（CD2 官方帮助页与生态扩展也都只承诺 magnet / ed2k）。
+    用户按旧文档粘贴直链后，收到的却是一句半技术文案，既看不懂也不知道下一步该干嘛。
+    """
+
+    HTTP_LINK = "https://example.com/video.mp4"
+
+    def test_is_http_link_is_case_insensitive_and_strict(self):
+        self.assertTrue(main._is_http_link("http://example.com/a"))
+        self.assertTrue(main._is_http_link("HTTPS://example.com/a"))
+        self.assertFalse(main._is_http_link("httpsx://example.com/a"))  # 不能被前缀近似匹配误伤
+        self.assertFalse(main._is_http_link("magnet:?xt=urn:btih:AAAA"))
+        self.assertFalse(main._is_http_link("ed2k://|file|a.avi|1|x|/"))
+        for empty in ("", "   ", None):
+            with self.subTest(empty=empty):
+                self.assertFalse(main._is_http_link(empty))
+
+    def test_unsupported_http_link_gets_dedicated_hint(self):
+        for raw in (
+            "cloud 115 does not support this url",
+            "unsupported link type",
+            "无法解析该链接",
+            "invalid url format",
+        ):
+            with self.subTest(raw=raw):
+                reason = main._friendly_reject_reason(raw, self.HTTP_LINK)
+                self.assertIn("HTTP/HTTPS 直链", reason)
+                self.assertIn("115open", reason)
+                self.assertIn("ed2k", reason)  # 必须给出替代方案，不能只说不行
+
+    def test_http_link_without_message_still_explained(self):
+        for raw in ("", "   ", None):
+            with self.subTest(raw=raw):
+                self.assertIn("HTTP/HTTPS 直链", main._friendly_reject_reason(raw, self.HTTP_LINK))
+
+    def test_unclassified_http_failure_keeps_reason_digest(self):
+        """归类不出时给「结论 + 原始原因摘要」，证据不丢（完整原文仍在日志）。"""
+        reason = main._friendly_reject_reason("奇怪的后端错误" * 40, self.HTTP_LINK)
+        self.assertIn("HTTP/HTTPS 直链", reason)
+        self.assertIn("原始原因：", reason)
+        self.assertIn("\n", reason)
+
+    def test_exception_path_explains_http_link(self):
+        """路径 (a)：gRPC 抛错但归类不出时，http 直链同样要给指导性文案。"""
+        message = main._describe_submit_failure(ValueError("backend exploded"), self.HTTP_LINK)
+        self.assertIn("HTTP/HTTPS 直链", message)
+        self.assertIn("backend exploded", message)
+
+    def test_transport_failure_beats_http_hint(self):
+        """真连不上 CD2 时绝不能说「云盘不支持直链」—— 网络故障必须优先归因。"""
+        error = Exception("failed to connect to all addresses")
+        message = main._describe_submit_failure(error, self.HTTP_LINK)
+        self.assertIn("CD2 连接异常", message)
+        self.assertNotIn("直链", message)
+
+    def test_duplicate_still_wins_over_http_hint(self):
+        """重复提交是更精确的原因，不能被「直链不受支持」抢走。"""
+        self.assertEqual(
+            main._friendly_reject_reason("任务已存在", self.HTTP_LINK),
+            main.DUPLICATE_REPLY,
+        )
+
+    def test_non_http_links_are_unaffected(self):
+        """回归保护：磁力 / ed2k 的文案一个字都不能变。"""
+        magnet = "magnet:?xt=urn:btih:AAAA"
+        self.assertEqual(main._friendly_reject_reason("任务已存在", magnet), main.DUPLICATE_REPLY)
+        self.assertEqual(
+            main._friendly_reject_reason("云盘配额不足", magnet),
+            "❌ 提交失败：云盘配额不足",
+        )
+        self.assertIn(
+            "不支持这个链接",
+            main._friendly_reject_reason("not supported", magnet),
+        )
+
+    def test_link_argument_is_optional(self):
+        """不传 link 时保持旧行为（向后兼容）。"""
+        self.assertEqual(main._friendly_reject_reason("任务已存在"), main.DUPLICATE_REPLY)
+        self.assertIn("不支持这个链接", main._friendly_reject_reason("not supported"))
+
+
 if __name__ == "__main__":
     unittest.main()

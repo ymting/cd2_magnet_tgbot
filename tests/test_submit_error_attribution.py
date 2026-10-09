@@ -222,6 +222,59 @@ class SubmitErrorAttributionTests(unittest.TestCase):
         self.assertEqual(reply_text.await_count, 1)
         self.assertIn("提交成功", reply_text.await_args.args[0])
 
+    # --- http(s) 直链：云盘拒绝 vs 真连不上，必须给出不同结论（v1.1.10-8）---
+
+    HTTP_LINK = "https://example.com/video.mp4"
+
+    def test_http_link_rejection_explains_drive_limitation(self):
+        """http 直链被云盘拒绝 → 结论（后端网盘不吃直链）+ 原始原因摘要。
+
+        CD2 的离线下载由后端网盘执行，115open 之类只吃磁力 / ed2k，
+        因此直链被拒时不能只丢一句「提交失败」让用户自己猜。
+        """
+        stub = SimpleNamespace(
+            AddOfflineFiles=AsyncMock(
+                return_value=SimpleNamespace(
+                    success=False, errorMessage="api error: code 400, url type not allowed"
+                )
+            )
+        )
+        update, reply_text = _make_update(text=self.HTTP_LINK)
+
+        with self.assertLogs("main", level="WARNING") as logs:
+            self._run_with_stub(stub, update)
+
+        message = reply_text.await_args.args[0]
+        self.assertIn("HTTP/HTTPS 直链", message)
+        self.assertIn("ed2k", message)  # 必须给出替代方案
+        # 与「重复提交」不同：直链的结论是**推测性**的（后端网盘不一定只因为格式拒绝），
+        # 所以要附一行摘要让用户能自行判断（如其实是链接失效 / 配额不足）。
+        # 注意这一行是 _shorten() 后的单行摘要，不是原样转发 —— 完整原文仍在日志里。
+        self.assertIn("原始原因：", message)
+        self.assertNotIn("\n\n", message)
+        self.assertTrue(
+            any("url type not allowed" in line for line in logs.output),
+            f"原始 errorMessage 必须完整写进日志，实际: {logs.output}",
+        )
+
+    def test_http_link_transport_failure_still_blames_connection(self):
+        """回归保护：真连不上 CD2 时，http 直链也不能被说成「网盘不支持直链」。"""
+        stub = SimpleNamespace(
+            AddOfflineFiles=AsyncMock(
+                side_effect=FakeAioRpcError(
+                    "StatusCode.UNAVAILABLE, failed to connect to all addresses"
+                )
+            )
+        )
+        update, reply_text = _make_update(text=self.HTTP_LINK)
+
+        with self.assertLogs("main", level="ERROR"):
+            self._run_with_stub(stub, update)
+
+        message = reply_text.await_args.args[0]
+        self.assertIn("CD2 连接异常", message)
+        self.assertNotIn("直链", message)
+
 
 class SafeSendTests(unittest.TestCase):
     def setUp(self):

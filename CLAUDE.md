@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-CloudDrive2 Telegram Bot (cd2_magnet_tgbot) - A Telegram bot that manages offline downloads for CloudDrive2. It accepts magnet/http/ed2k links, submits them to CD2 for offline download, and provides automated cleanup functionality.
+CloudDrive2 Telegram Bot (cd2_magnet_tgbot) - A Telegram bot that manages offline downloads for CloudDrive2. It accepts magnet/ed2k/http(s) links, submits them to CD2 for offline download, and provides automated cleanup functionality. Note: CD2 delegates offline downloads to the **backing cloud drive**, so magnet/ed2k are reliably supported while http(s) direct links usually are not (115open only takes magnet/ed2k).
 
 **Tech Stack**: Python 3.13 + python-telegram-bot (v22+) + gRPC + Docker
 
@@ -101,9 +101,10 @@ classified, and handling only one is a real bug that shipped in v1.1.9:
   often carries raw cloud-drive API content (English, error codes, JSON). Handle via
   `_friendly_reject_reason()`.
 
-Both share `_classify_reject_reason()`, which returns `DUPLICATE_REPLY` for duplicate hints
-(`已存在` / `已在` / `重复` / `already exist` / `duplicate` …), a `CD2_TOKEN` hint for auth
-failures, a "not supported" reply, or `None` when unclassified.
+Both share `_classify_reject_reason(raw, link)`, which returns `DUPLICATE_REPLY` for duplicate
+hints (`已存在` / `已在` / `重复` / `already exist` / `duplicate` …), a `CD2_TOKEN` hint for auth
+failures, a "not supported" reply (swapped for the http(s)-direct-link reply when `link` is an
+http(s) URL), or `None` when unclassified.
 
 Rules:
 - **`INTERNAL` is not a connection problem.** Only `UNAVAILABLE` / `DEADLINE_EXCEEDED`
@@ -117,6 +118,19 @@ Rules:
 - Adding a category means adding keywords to the hint tuples and a test in
   `tests/test_reject_message_format.py` (plus an end-to-end case in
   `tests/test_submit_error_attribution.py` when the new path is submit-related).
+- **http(s) direct links get their own explanation.** CD2's offline download is executed by the
+  **backing cloud drive** (115open / Xunlei / PikPak); 115open-type drives only take magnet/ed2k,
+  so a direct link is almost always rejected. When `link` is http(s) and submission fails,
+  return `_http_direct_link_reply()`: the conclusion first, plus an `原始原因：<digest>` line
+  when the reason is unclassified.
+- **Attribution order is load-bearing**: duplicate / auth > **real transport failure
+  (`UNAVAILABLE` / `DEADLINE_EXCEEDED`)** > http(s)-direct-link hint > generic fallback.
+  The transport check must come *before* the http(s) hint, otherwise a genuinely unreachable
+  CD2 gets mislabelled as "your drive does not support direct links" and the network problem
+  everyone should be looking at gets buried
+  (`HttpDirectLinkFailureTests.test_transport_failure_beats_http_hint` guards this).
+- `_is_http_link()` uses a strict `startswith(("http://", "https://"))` — never `in` or a loose
+  match, or `httpsx://…` would be misjudged.
 
 ### Batch Links (v1.1.10-5+)
 A single message may carry **several links of mixed schemes** (magnet / ed2k / http(s)).

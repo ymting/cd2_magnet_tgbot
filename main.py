@@ -1,16 +1,18 @@
 # -*- coding: utf-8 -*-
 """
 项目名称: CloudDrive2 Telegram 离线下载管家
-版本: 1.1.10-7 (dev 预发布；生产发版时改为 1.1.10)
+版本: 1.1.10-8 (dev 预发布；生产发版时改为 1.1.10)
 功能描述:
-    1. 链接监听: 自动识别 Magnet、HTTP、ed2k 链接并提交至 CD2 离线下载。
+    1. 链接监听: 自动识别 Magnet、ed2k、http(s) 直链并提交至 CD2 离线下载。
        支持一条消息里混合粘贴多个不同类型的链接，逐个提交后汇总回执。
+       注意 http(s) 直链能否真正下载取决于后端网盘（115open 通常只支持磁力 / ed2k）。
     2. 定时清理: 基于 Cron 表达式，递归扫描下载目录，删除小文件和黑名单文件，清理空目录。
     3. 异常容错: 增加全局错误处理与 gRPC 超时控制，防止网络波动导致假死。
     4. 轮询看门狗: 周期检测 Telegram 轮询协程是否已死亡，避免「容器活着但收不到消息」的永久静默。
     5. 故障归因: 提交(CD2/gRPC)与回执(Telegram/httpx)分开处理，回执失败不再误报为「CD2 连接异常」。
     6. 拒绝提示口语化: CD2 的业务拒绝(含重复提交)不再转发技术性报错，改为归类成简短人话。
        覆盖两条路径: gRPC 抛异常(115open 把重复链接报成 INTERNAL)与 res.success=False。
+       http(s) 直链被拒时单独给出指导性说明（后端网盘通常不吃直链），并附原文摘要备查。
 作者: ymting
 """
 
@@ -28,7 +30,7 @@ from typing import NamedTuple
 # 版本号
 # 版本号。唯一来源：CI 直接从这里读取并生成镜像标签（见 docker-publish.yml）。
 # 约定：master 上是生产版本（如 1.1.10），dev 分支上带 -n 后缀（如 1.1.10-1、1.1.10-2）。
-__version__ = "1.1.10-7"
+__version__ = "1.1.10-8"
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from telegram import Update, BotCommand
@@ -356,10 +358,13 @@ def _mask_link(link: str, limit: int = 80) -> str:
 # ---------------------------------------------------------------------------
 # 链接解析：一条消息里可能同时出现多个不同类型的链接
 # ---------------------------------------------------------------------------
-# CD2 的 AddOfflineFiles 接受 magnet / ed2k / http(s)，这里用同一套正则把消息正文里的
-# 链接全部抠出来 —— 不再要求整条消息以链接开头，因此
+# 这里用同一套正则把消息正文里的链接全部抠出来（magnet / ed2k / http(s)），
+# 不再要求整条消息以链接开头，因此
 # 「1. magnet:... 2. ed2k://... 3. https://...」这类带序号或项目符号的列表也能识别。
 # （旧实现用 startswith 判断，遇到序号前缀会整条消息被丢弃，一个都提交不了。）
+#
+# 关于 http(s)：正则**照常识别**它们（用户确实可能粘贴直链），但能否真正下载取决于
+# CD2 背后的网盘 —— 详见 _HTTP_SCHEMES 处的说明，提交失败时会给出指导性文案。
 
 # 中文标点。它们永远不会出现在链接里，却常常紧跟链接出现（「链接：magnet:...。还有 ed2k://...」），
 # 必须在这里就截断匹配，否则会把后面的正文一起吞进链接。
@@ -528,6 +533,34 @@ _UNSUPPORTED_HINTS = (
     "not support", "unsupported", "invalid url", "不支持", "无法解析",
 )
 
+# HTTP/HTTPS 直链。CD2 的离线下载是由**后端网盘**执行的（115open / 迅雷 / PikPak），
+# 而 115open 这类网盘通常只吃磁力 / ed2k，直链基本会被拒。
+# 用户很可能因为 README 的旧承诺（「支持 http://」）而粘贴直链，
+# 所以这类失败必须给一句有指导性的说明，而不是笼统的「不支持这个链接」。
+_HTTP_SCHEMES = ("http://", "https://")
+_HTTP_DIRECT_LINK_REASON = (
+    "HTTP/HTTPS 直链通常无法通过 CD2 离线下载"
+    "（CD2 由后端网盘执行下载，115open 之类的网盘一般只支持磁力 / ed2k）。"
+    "请改用磁力或 ed2k 链接。"
+)
+
+
+def _is_http_link(link: str | None) -> bool:
+    """判断是否为 http/https 直链（大小写不敏感）。"""
+    return bool(link) and link.lower().startswith(_HTTP_SCHEMES)
+
+
+def _http_direct_link_reply(detail: str = "") -> str:
+    """http(s) 直链提交失败时的专用文案。
+
+    detail 非空时附一行「原始原因」摘要（已单行化 + 截断）：结论在前、证据在后，
+    既说清楚「为什么不行」，又不会把云盘 API 原文整段甩给用户。
+    """
+    reply = f"❌ 提交失败：{_HTTP_DIRECT_LINK_REASON}"
+    if detail:
+        reply += f"\n原始原因：{_shorten(detail)}"
+    return reply
+
 # 剥掉 CD2 常见的动作前缀，避免「添加离线下载任务失败: xxx」这类无信息量的重复措辞占满屏幕
 _REJECT_PREFIXES = (
     "添加离线下载任务失败:", "添加离线任务失败:", "添加离线文件失败:",
@@ -590,11 +623,14 @@ def _is_transport_failure(error: BaseException) -> bool:
     return any(hint in lowered for hint in _TRANSPORT_TEXT_HINTS)
 
 
-def _classify_reject_reason(raw_message: str) -> str | None:
+def _classify_reject_reason(raw_message: str, link: str | None = None) -> str | None:
     """识别报错文本属于哪类已知拒绝；识别不出返回 None，由调用方兜底。
 
     单独抽出来是为了让两条路径共用同一套判断：
     gRPC 异常走 _describe_submit_failure()，success=False 走 _friendly_reject_reason()。
+
+    link 只参与「不支持」这一类的措辞：http(s) 直链被拒几乎总是因为后端网盘不吃直链，
+    单独给一句指导性文案；其余类别与报错文本强相关，不依赖 link。
     """
     text = (raw_message or "").strip()
     if not text:
@@ -606,23 +642,32 @@ def _classify_reject_reason(raw_message: str) -> str | None:
     if any(hint in lowered for hint in _AUTH_HINTS):
         return "❌ 提交失败：CD2 授权失效，请检查 CD2_TOKEN 是否有效。"
     if any(hint in lowered for hint in _UNSUPPORTED_HINTS):
+        if _is_http_link(link):
+            return _http_direct_link_reply()
         return "❌ 提交失败：CD2 不支持这个链接（格式无法解析或网盘不支持离线下载）。"
     return None
 
 
-def _friendly_reject_reason(raw_message: str) -> str:
+def _friendly_reject_reason(raw_message: str, link: str | None = None) -> str:
     """路径 (b)：res.success=False 时，把 errorMessage 转成用户看得懂的一句话。
 
     识别不出类别的错误只做「去前缀 + 截断」，不会丢信息 —— 原文完整记录在日志中。
     """
-    classified = _classify_reject_reason(raw_message)
+    classified = _classify_reject_reason(raw_message, link)
     if classified:
         return classified
 
     text = (raw_message or "").strip()
     if not text:
         # CD2 只回了 success=false 却没给原因，不能让用户对着空白猜
+        if _is_http_link(link):
+            return _http_direct_link_reply()
         return "❌ 提交失败：CD2 未说明原因，请稍后在 CloudDrive2 中确认任务状态。"
+
+    # http(s) 直链的失败原文五花八门（网盘不吃直链 / 格式不认 / 资源失效…），
+    # 归不到具体类别时统一给「直链不受支持」的指导性结论，并附原文摘要备查。
+    if _is_http_link(link):
+        return _http_direct_link_reply(text)
 
     lowered = text.lower()
     for prefix in _REJECT_PREFIXES:
@@ -632,22 +677,28 @@ def _friendly_reject_reason(raw_message: str) -> str:
     return f"❌ 提交失败：{_shorten(text)}"
 
 
-def _describe_submit_failure(error: BaseException) -> str:
+def _describe_submit_failure(error: BaseException, link: str | None = None) -> str:
     """路径 (a)：提交阶段抛异常时，给用户看的一句话。
 
-    分三种情况，顺序不能换：
+    分四种情况，顺序不能换：
       1. 能归类出业务原因（重复提交 / 授权 / 不支持）→ 说人话，**不提「连接异常」**；
-      2. 真正的传输层故障（UNAVAILABLE / DEADLINE_EXCEEDED）→ 才说「CD2 连接异常」；
-      3. 其余未知错误 → 如实说失败 + 异常类型名，同样不误导成连接问题。
+      2. 真正的传输层故障（UNAVAILABLE / DEADLINE_EXCEEDED）→ 才说「CD2 连接异常」。
+         这一步必须排在 http 直链判断**之前** —— 否则真的连不上 CD2 时，
+         会被误报成「云盘不支持直链」，把最该排查的网络问题藏起来；
+      3. http(s) 直链的其它失败 → 归因到「直链不受支持」并附原文摘要；
+      4. 其余未知错误 → 如实说失败 + 异常类型名，同样不误导成连接问题。
     """
     raw = _grpc_error_raw(error)
 
-    classified = _classify_reject_reason(raw)
+    classified = _classify_reject_reason(raw, link)
     if classified:
         return classified
 
     if _is_transport_failure(error):
         return f"❌ 提交失败，CD2 连接异常（{type(error).__name__}）：{_shorten(raw)}"
+
+    if _is_http_link(link):
+        return _http_direct_link_reply(raw)
 
     if not raw:
         return "❌ 提交失败：CD2 未说明原因，请稍后在 CloudDrive2 中确认任务状态。"
@@ -732,12 +783,12 @@ async def _submit_offline_link(stub, metadata, link: str) -> SubmitOutcome:
         # 日志留全；用户侧只说人话 —— 云盘的业务拒绝(如 115open 的「任务已存在」)
         # 也是以 gRPC 异常抛出的，直接展示 AioRpcError 的 4 行 repr 毫无意义。
         logger.exception("❌ 提交 CD2 离线下载失败 [%s]: %s", type(e).__name__, _mask_link(link))
-        return SubmitOutcome(False, _describe_submit_failure(e), "CD2 提交失败回执")
+        return SubmitOutcome(False, _describe_submit_failure(e, link), "CD2 提交失败回执")
 
     if not res.success:
         # 原始 errorMessage 只进日志：它是面向开发者的描述，原样转发给用户既看不懂也容易吓人。
         logger.warning("⚠️ CD2 拒绝离线下载请求: %s | 链接: %s", res.errorMessage, _mask_link(link))
-        return SubmitOutcome(False, _friendly_reject_reason(res.errorMessage), "CD2 拒绝回执")
+        return SubmitOutcome(False, _friendly_reject_reason(res.errorMessage, link), "CD2 拒绝回执")
 
     logger.info("✅ 已提交离线下载: %s", _mask_link(link))
     return SubmitOutcome(True, "✅ 提交成功", "提交成功回执")
@@ -794,7 +845,7 @@ async def _reply_single_link(update: Update, link: str) -> None:
     except Exception as e:
         # 建连阶段就失败（例如 CD2_ADDRESS 填错导致地址非法），此时单条归类无从产生
         logger.exception("❌ 提交 CD2 离线下载失败 [%s]: %s", type(e).__name__, _mask_link(link))
-        outcome = SubmitOutcome(False, _describe_submit_failure(e), "CD2 提交失败回执")
+        outcome = SubmitOutcome(False, _describe_submit_failure(e, link), "CD2 提交失败回执")
 
     if not outcome.ok:
         await _safe_send(update.message.reply_text, outcome.message, description=outcome.description)
@@ -831,6 +882,8 @@ async def _submit_batch_links(update: Update, links: list[str]) -> None:
         # 只有建连/通道层面的异常会走到这里（单条提交的异常已在 _submit_offline_link 内部归类）。
         # 已提交的链接结果必须保留，未轮到的按同一条原因批量标注，不能整批丢弃。
         logger.exception("❌ 批量提交提前中断 [%s]", type(e).__name__)
+        # 这里**刻意不传 link**：中断影响的是「尚未轮到的整批链接」，它们协议可能混杂，
+        # 用单条链接的上下文（如「http 直链不受支持」）会给出对整个批次都错误的结论。
         reason = _describe_submit_failure(e)
         results.extend(
             (link, SubmitOutcome(False, reason, "批量提交中断回执"))
