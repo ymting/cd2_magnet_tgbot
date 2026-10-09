@@ -139,6 +139,19 @@ A single message may carry **several links of mixed schemes** (magnet / ed2k / h
   See `LinkPasteFormatTests` before touching it.
 - Zero-width characters (`_INVISIBLE_CHARS`) are deleted as noise, never treated as separators —
   treating them as separators would split a link in half.
+- **Forwarded messages arrive in three shapes and all three must work** (`_collect_message_links()`):
+  1. plain `text` — forwarding never rewrites the body;
+  2. a **media post's `caption`** — the link lives there and `text` is `None`. This is the most
+     common shape when forwarding a torrent/resource post, and the old `text`-only read silently
+     ignored it (no error, just no response — the hardest kind to notice);
+  3. **`text_link` entities** — the body is just "点此下载" and the URL sits in `entity.url`;
+     check **both** `entities` and `caption_entities`.
+- The handler filter must stay `(filters.TEXT | filters.CAPTION) & ~filters.COMMAND`
+  (`LINK_MESSAGE_FILTER`). A `filters.TEXT`-only filter drops caption messages **before** the
+  handler runs, so the bug is invisible from inside `handle_link` — only a filter-level test
+  (`MessageFilterTests`) catches it.
+- `text_link` URLs are accepted only for `magnet:`/`ed2k://`. http(s) hyperlinks in forwarded
+  posts are usually channels/groups/ads and would just spam failure replies.
 - **Each link is submitted in its own `AddOfflineFiles` call** (one shared channel/stub for
   the whole batch), so success/failure is attributable per link and one rejection cannot
   abort the rest. Do not "optimize" this back into one joined `urls` string.

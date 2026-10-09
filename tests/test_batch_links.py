@@ -14,8 +14,12 @@
 
 import asyncio
 import unittest
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
+
+from telegram import Chat, Message, MessageEntity, Update
+from telegram.ext import filters
 
 import main
 
@@ -148,15 +152,141 @@ class LinkPasteFormatTests(unittest.TestCase):
                 self.assertEqual(main._extract_links(link), [link])
 
 
-def _make_update(text):
+def _make_update(text=None, caption=None, entities=None, caption_entities=None):
     """批量路径需要 reply_text 返回一个「能被 edit_text」的消息对象。"""
     edit_text = AsyncMock()
     reply_text = AsyncMock(return_value=SimpleNamespace(edit_text=edit_text))
     update = SimpleNamespace(
         effective_user=SimpleNamespace(id=123),
-        message=SimpleNamespace(text=text, reply_text=reply_text),
+        message=SimpleNamespace(
+            text=text,
+            caption=caption,
+            entities=entities,
+            caption_entities=caption_entities,
+            reply_text=reply_text,
+        ),
     )
     return update, reply_text, edit_text
+
+
+def _make_message(text=None, caption=None, entities=None, caption_entities=None):
+    return SimpleNamespace(
+        text=text, caption=caption, entities=entities, caption_entities=caption_entities
+    )
+
+
+def _text_link(url, display="点此下载"):
+    """构造一个 text_link 实体（正文里只有显示文字，地址藏在 url 里）。"""
+    return SimpleNamespace(type="text_link", url=url, offset=0, length=len(display))
+
+
+class ForwardedMessageTests(unittest.TestCase):
+    """转发来的消息有三种形态，必须都能识别 —— 用户实际就是这么用的。
+
+    1. 纯文本：转发不改写正文，`text` 原样保留（本来就支持）；
+    2. 媒体帖 + 说明文字：链接在 `caption` 里、`text` 为 None —— **旧实现只读 text，
+       这类转发完全没反应**，而转发种子/资源帖最常见的就是这个形态；
+    3. 超链接实体：正文只有「点此下载」，地址在 `entity.url` 里，纯文本解析看不到。
+    """
+
+    def test_plain_text_is_collected(self):
+        links = main._collect_message_links(_make_message(text=MAGNET_A))
+        self.assertEqual(links, [MAGNET_A])
+
+    def test_caption_only_message_is_collected(self):
+        links = main._collect_message_links(_make_message(text=None, caption=MAGNET_A))
+        self.assertEqual(links, [MAGNET_A])
+
+    def test_caption_batch_is_collected(self):
+        links = main._collect_message_links(
+            _make_message(text=None, caption=f"{MAGNET_A}\n{ED2K}\n{HTTP_LINK}")
+        )
+        self.assertEqual(links, [MAGNET_A, ED2K, HTTP_LINK])
+
+    def test_text_link_entity_magnet_is_collected(self):
+        message = _make_message(text="点此下载", entities=[_text_link(MAGNET_A)])
+        self.assertEqual(main._collect_message_links(message), [MAGNET_A])
+
+    def test_text_link_entity_ed2k_is_collected(self):
+        message = _make_message(text="点此下载", entities=[_text_link(ED2K)])
+        self.assertEqual(main._collect_message_links(message), [ED2K])
+
+    def test_caption_entities_are_also_checked(self):
+        """说明文字里的超链接挂在 caption_entities 上，不能只看 entities。"""
+        message = _make_message(caption="点此下载", caption_entities=[_text_link(MAGNET_A)])
+        self.assertEqual(main._collect_message_links(message), [MAGNET_A])
+
+    def test_http_text_link_is_ignored(self):
+        """http(s) 超链接多半是频道/群组/广告，不能被当成下载链接提交。"""
+        message = _make_message(
+            text="加入频道", entities=[_text_link("https://t.me/some_channel")]
+        )
+        self.assertEqual(main._collect_message_links(message), [])
+
+    def test_text_and_entity_duplicates_are_merged(self):
+        """同一条链接同时出现在正文与实体里时只提交一次，否则会白挨一次「重复提交」。"""
+        message = _make_message(text=MAGNET_A, entities=[_text_link(MAGNET_A)])
+        self.assertEqual(main._collect_message_links(message), [MAGNET_A])
+
+    def test_message_without_any_link_is_empty(self):
+        for message in (
+            _make_message(text="今天天气不错"),
+            _make_message(text=None, caption=None),
+        ):
+            with self.subTest(message=message):
+                self.assertEqual(main._collect_message_links(message), [])
+
+    def test_caption_only_message_reaches_cd2_end_to_end(self):
+        """端到端：转发一条「媒体 + 说明文字」的消息，链接要真的提交到 CD2。"""
+        self._original_admin_ids = main.ADMIN_IDS
+        main.ADMIN_IDS = [123]
+        try:
+            stub = SimpleNamespace(
+                AddOfflineFiles=AsyncMock(
+                    return_value=SimpleNamespace(success=True, errorMessage="")
+                )
+            )
+            update, reply_text, _ = _make_update(text=None, caption=MAGNET_A)
+            with patch("main.grpc.aio.insecure_channel", return_value=_FakeChannel()), patch(
+                "main.clouddrive_pb2_grpc.CloudDriveFileSrvStub", return_value=stub
+            ):
+                asyncio.run(main.handle_link(update, None))
+
+            self.assertEqual(stub.AddOfflineFiles.await_count, 1)
+            self.assertEqual(stub.AddOfflineFiles.await_args.args[0].urls, MAGNET_A)
+            self.assertIn("提交成功", reply_text.await_args.args[0])
+        finally:
+            main.ADMIN_IDS = self._original_admin_ids
+
+
+class MessageFilterTests(unittest.TestCase):
+    """处理器过滤器的回归：只写 filters.TEXT 会让转发媒体帖被静默挡在门外。"""
+
+    _CHAT = Chat(id=1, type="private")
+    _NOW = datetime(2026, 10, 9, 12, 0, tzinfo=timezone.utc)
+
+    def _update(self, **kwargs):
+        return Update(
+            update_id=1,
+            message=Message(message_id=1, date=self._NOW, chat=self._CHAT, **kwargs),
+        )
+
+    def test_text_and_caption_are_both_accepted(self):
+        self.assertTrue(main.LINK_MESSAGE_FILTER.filter(self._update(text=MAGNET_A)))
+        self.assertTrue(main.LINK_MESSAGE_FILTER.filter(self._update(caption=ED2K)))
+
+    def test_commands_are_still_rejected(self):
+        update = self._update(
+            text="/clean",
+            entities=[MessageEntity(type="bot_command", offset=0, length=6)],
+        )
+        self.assertFalse(main.LINK_MESSAGE_FILTER.filter(update))
+
+    def test_text_only_filter_would_drop_caption_messages(self):
+        """回归断言：这正是旧实现的缺陷 —— 只写 filters.TEXT 时 caption 消息进不来。"""
+        message = Message(message_id=1, date=self._NOW, chat=self._CHAT, caption=ED2K)
+        self.assertFalse(filters.TEXT.filter(message))
+        self.assertTrue(filters.CAPTION.filter(message))
 
 
 class BatchSubmitTests(unittest.TestCase):

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 项目名称: CloudDrive2 Telegram 离线下载管家
-版本: 1.1.10-6 (dev 预发布；生产发版时改为 1.1.10)
+版本: 1.1.10-7 (dev 预发布；生产发版时改为 1.1.10)
 功能描述:
     1. 链接监听: 自动识别 Magnet、HTTP、ed2k 链接并提交至 CD2 离线下载。
        支持一条消息里混合粘贴多个不同类型的链接，逐个提交后汇总回执。
@@ -28,7 +28,7 @@ from typing import NamedTuple
 # 版本号
 # 版本号。唯一来源：CI 直接从这里读取并生成镜像标签（见 docker-publish.yml）。
 # 约定：master 上是生产版本（如 1.1.10），dev 分支上带 -n 后缀（如 1.1.10-1、1.1.10-2）。
-__version__ = "1.1.10-6"
+__version__ = "1.1.10-7"
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from telegram import Update, BotCommand
@@ -387,6 +387,11 @@ _WRAPPER_PAIRS = {")": "(", "]": "[", "}": "{", "`": "`"}
 # 它们不是分隔符（不能用来断句），而是噪音，按「直接删除」处理。
 _INVISIBLE_CHARS = str.maketrans("", "", "\u200b\u200c\u200d\u2060\ufeff")
 
+# 超链接实体（text_link）里只认这两种协议。
+# 为什么只认这两种：转发来的消息里 http(s) 超链接多半是频道、群组、广告，
+# 把它们当下载链接提交只会给用户刷一串失败提示；而 magnet / ed2k 一定是下载意图。
+_LINK_ENTITY_SCHEMES = ("magnet:", "ed2k://")
+
 # 去掉协议头后至少还要有这么多字符才算一个「像样的」链接，
 # 用来挡掉正文里出现的裸 "https://" 之类的碎片。
 _LINK_MIN_BODY_CHARS = 3
@@ -428,25 +433,23 @@ def _clean_link_tail(link: str, scheme_end: int) -> str:
         link = cleaned
 
 
-def _extract_links(text: str | None) -> list[str]:
-    """从消息正文里提取所有链接，按出现顺序返回，并去掉完全重复的条目。
+def _normalize_links(candidates) -> list[str]:
+    """把原始候选串清洗成可提交的链接，按顺序去重后返回。
 
-    链接之间用换行、空格、制表符还是全角空格分隔都能识别 —— 正则按空白切分，
-    所以「一行一个链接」这种最常见的粘贴方式天然被覆盖。
-    一行里的链接也不会互相污染：匹配到 URL 后又遇到下一个协议名时，
-    前一个链接已经在标点/空白处结束。
-
-    为什么要去重：同一条消息里重复粘贴同一个链接时，逐个提交必然全部被 CD2 判为重复，
-    真正有价值的信息是「其它链接有没有提交成功」，没必要让重复项占满报告。
+    明文解析与超链接实体两条来源共用这一层，保证清洗规则不会两边不一致。
+    处理内容：协议名统一小写、删零宽字符、剥尾部标点与包裹符号、挡掉没有正文的碎片。
     """
     links: list[str] = []
     seen: set[str] = set()
 
-    for match in _LINK_PATTERN.finditer(text or ""):
-        raw = match.group(0)
+    for raw in candidates:
+        if not raw:
+            continue
         # 协议名统一小写（用户可能手打成 Magnet: / HTTPS://），其后的内容原样保留 ——
         # 对整串 lower() 会改掉 magnet 里 dn 显示名等参数的大小写。
-        scheme_end = raw.index(":") + 1
+        scheme_end = raw.find(":") + 1
+        if scheme_end == 0:  # 连协议名都没有，不是链接
+            continue
         link = (raw[:scheme_end].lower() + raw[scheme_end:]).translate(_INVISIBLE_CHARS)
         link = _clean_link_tail(link, scheme_end)
 
@@ -456,6 +459,43 @@ def _extract_links(text: str | None) -> list[str]:
         links.append(link)
 
     return links
+
+
+def _extract_links(text: str | None) -> list[str]:
+    """从一段纯文本里提取所有链接，按出现顺序返回，并去掉完全重复的条目。
+
+    链接之间用换行、空格、制表符还是全角空格分隔都能识别 —— 正则按空白切分，
+    所以「一行一个链接」这种最常见的粘贴方式天然被覆盖。
+
+    为什么要去重：同一条消息里重复粘贴同一个链接时，逐个提交必然全部被 CD2 判为重复，
+    真正有价值的信息是「其它链接有没有提交成功」，没必要让重复项占满报告。
+    """
+    return _normalize_links(match.group(0) for match in _LINK_PATTERN.finditer(text or ""))
+
+
+def _collect_message_links(message) -> list[str]:
+    """汇总一条消息里所有可提交的链接，兼容转发的各种形态。
+
+    三种来源，缺一不可：
+      1. `text` —— 纯文本消息（转发不会改写正文，所以转发来的链接照样能提取）；
+      2. `caption` —— **媒体帖的说明文字**，转发种子 / 资源帖最常见就是这个形态，
+         此时 `text` 为 None，旧实现只读 `text`，对这类转发完全不响应；
+      3. `text_link` 超链接实体 —— 正文里只有「点此下载」几个字，真实地址在
+         `entity.url` 里，纯文本解析永远看不到（只取 magnet / ed2k，理由见 `_LINK_ENTITY_SCHEMES`）。
+
+    两种来源合并后统一去重，避免同一条链接被提交两次。
+    """
+    text = getattr(message, "text", None) or getattr(message, "caption", None) or ""
+    candidates = [match.group(0) for match in _LINK_PATTERN.finditer(text)]
+
+    # 文字实体挂在 text 上，说明文字的实体挂在 caption 上，两个字段都要看
+    for field in ("entities", "caption_entities"):
+        for entity in getattr(message, field, None) or []:
+            url = getattr(entity, "url", None)
+            if url and url.lower().startswith(_LINK_ENTITY_SCHEMES):
+                candidates.append(url)
+
+    return _normalize_links(candidates)
 
 
 # ---------------------------------------------------------------------------
@@ -737,6 +777,13 @@ def _build_batch_report(results: list[tuple[str, SubmitOutcome]]) -> str:
     return "\n".join(lines)
 
 
+# 处理器的消息过滤器。抽成模块级常量有两个原因：
+#   1. 必须带上 CAPTION —— 媒体帖（转发种子/资源帖的常见形态）正文在 caption 里、
+#      text 为 None，只写 filters.TEXT 的话这类转发会被过滤器直接挡掉，机器人毫无反应；
+#   2. 抽出来才能被单元测试直接断言（见 tests/test_batch_links.py 的 MessageFilterTests）。
+LINK_MESSAGE_FILTER = (filters.TEXT | filters.CAPTION) & ~filters.COMMAND
+
+
 async def _reply_single_link(update: Update, link: str) -> None:
     """单链接路径：保持原有的回执文案（成功时带目录与 /clean 提示）。"""
     try:
@@ -804,10 +851,13 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     支持一条消息里混合出现多个不同类型的链接（magnet / ed2k / http(s)）：
     逐个提交后汇总成一份报告；只有一个链接时沿用原有的单条回执文案。
+
+    能覆盖的转发形态见 `_collect_message_links` —— 明文、媒体帖说明文字（caption）、
+    以及超链接形式的磁力/ed2k。
     """
     if update.effective_user.id not in ADMIN_IDS: return
 
-    links = _extract_links(update.message.text)
+    links = _collect_message_links(update.message)
     if not links:
         return
 
@@ -947,7 +997,8 @@ if __name__ == '__main__':
     app.add_error_handler(error_handler)
 
     # 注册消息与指令处理器
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_link))
+    # 链接处理器同时吃 text 与 caption：转发来的媒体帖正文在 caption 里（见 LINK_MESSAGE_FILTER）
+    app.add_handler(MessageHandler(LINK_MESSAGE_FILTER, handle_link))
     app.add_handler(CommandHandler("clean", cmd_clean))
     app.add_handler(CommandHandler("blacklist", cmd_blacklist))
 
