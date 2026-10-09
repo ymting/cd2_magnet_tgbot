@@ -1,6 +1,6 @@
 # CloudDrive2 Telegram 下载管理器
 
-**版本: 1.1.10-3 (dev 预发布)**
+**版本: 1.1.10-4 (dev 预发布)**
 
 项目简介：
 这是一个专为 CloudDrive2 (CD2) 开发的 Telegram 机器人助手。它能够接收磁力链接、HTTP 链接及 ed2k 链接，并自动提交至 CD2 执行离线下载，同时提供强大的自动化后期清理功能。
@@ -74,7 +74,7 @@ git tag v1.1.10 && git push origin v1.1.10   # 触发正式镜像 + Release
 services:
   cd2-bot:
     image: ghcr.io/ymting/cd2_magnet_tgbot:latest
-    container_name: cd2_tg_bot
+    container_name: cd2_magnet_tgbot
     restart: always
     volumes:
       # 可选：把黑名单挂到宿主机，容器重建后仍保留你添加的关键词；
@@ -115,6 +115,17 @@ git pull && docker compose up -d --build
 
 **少了 `--build` 会继续使用旧镜像** —— 表现为「代码明明更新了，机器人行为却没变」，这个坑很难自己发现。
 
+### 常用运维命令（容器名 `cd2_magnet_tgbot`）
+
+```bash
+docker logs -f cd2_magnet_tgbot                  # 看实时日志
+docker inspect -f '{{.State.Status}} exit={{.State.ExitCode}} restarts={{.RestartCount}}' cd2_magnet_tgbot
+docker compose down && docker compose up -d       # 彻底重建
+```
+
+> 如果你之前用的是别的容器名（`cd2_tg_bot` / `tg_cd2_manager`），换名后第一次 `up -d` 可能报
+> `container name ... is already in use` —— 先 `docker rm -f 旧名字` 再启动即可。
+
 ---
 
 ## 📖 环境变量详细说明
@@ -153,12 +164,17 @@ git pull && docker compose up -d --build
 
 ## 🛠️ 更新日志
 
+### v1.1.10-4 (dev 预发布，未发生产)
+* **容器名定为 `cd2_magnet_tgbot`**（与仓库/镜像同名，便于 `docker logs`、`docker exec` 时一眼对上），根 compose 与 README 示例同步。
+* **升级提醒**：如果你的服务器上跑着的容器是旧名字（`cd2_tg_bot` / `tg_cd2_manager`），直接 `docker compose up -d` 可能报
+  `container name ... is already in use`。先删掉旧容器再起即可：`docker rm -f cd2_tg_bot`。
+
 ### v1.1.10-3 (dev 预发布，未发生产)
 * **修掉 compose 里的 `build: .`**：仓库根 `docker-compose.yml` 原本写的是本地构建，而文档里写的升级方式是
   `docker compose pull` —— **两者对不上**，照文档做会拉到空、照文件做又必须记得加 `--build`。
   现统一改为 `image: ghcr.io/ymting/cd2_magnet_tgbot:latest`，与 README 示例一致；
   本地构建与 dev 测试镜像都以注释形式保留在文件里。
-* **统一容器名**：README 示例里的 `tg_cd2_manager` 与根 compose 的 `cd2_tg_bot` 不一致，现统一为 `cd2_tg_bot`。
+* **统一容器名**：README 示例里的 `tg_cd2_manager` 与根 compose 的 `cd2_tg_bot` 不一致，现两处保持一致。
 * **文档补「升级 / 回滚」小节**：明确 `--build` 漏了会继续用旧镜像这个坑。
 
 ### v1.1.10-2 (dev 预发布，未发生产)
