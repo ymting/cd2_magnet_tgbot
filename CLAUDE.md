@@ -44,10 +44,10 @@ Integration behavior still requires `python main.py` against a live CloudDrive2 
 ## Architecture
 
 ### Single-File Design
-All business logic resides in `main.py` (~335 lines; version string in `__version__`). The code is organized into 4 commented sections (referenced by function name since line numbers drift):
+All business logic resides in `main.py` (~580 lines; version string in `__version__`). The code is organized into 4 commented sections (referenced by function name since line numbers drift):
 1. **Variable Configuration**: env vars → module constants (note the renames, see Environment Variables below)
 2. **Core Cleanup Logic**: `get_blacklist()`, `get_all_items_recursive()`, `is_directory_empty()`, `clean_task_folder()`, `run_auto_clean()`
-3. **Telegram Handlers**: `error_handler()`, `handle_link()`, `cmd_clean()`, `cmd_blacklist()`, `post_init()`
+3. **Telegram Handlers**: `error_handler()`, `_get_polling_task()`, `watchdog_check()`, `_mask_link()`, `_safe_send()`, `handle_link()`, `cmd_clean()`, `cmd_blacklist()`, `post_init()`
 4. **Entry Point** (`__main__`): proxy/`HTTPXRequest` setup, `ApplicationBuilder` wiring, `run_polling()`
 
 ### Key Components
@@ -66,6 +66,23 @@ async with grpc.aio.insecure_channel(CD2_IP_PORT) as channel:
     metadata = [('authorization', f'Bearer {CD2_TOKEN}')]
     # All gRPC calls require metadata and timeout (15-30s) to prevent hanging
 ```
+
+### Failure Attribution (v1.1.8+)
+**Never wrap a CD2/gRPC call and a Telegram reply in the same `except` block.** They are
+independent links: gRPC talks to CloudDrive2, the reply talks to Telegram through the proxy.
+An `httpx.ConnectError` can *only* come from the Telegram side — a gRPC failure surfaces as
+`StatusCode.UNAVAILABLE`. Merging them produced the misleading
+`❌ 提交失败，CD2 连接异常: httpx.ConnectError:` while the download had in fact been submitted,
+and left no trace in `docker logs` (httpx only logs a request once a response arrives, so a
+failed connection is completely silent).
+
+Convention:
+- Submit first, reply second. Only the submit step may report `CD2 连接异常` (include
+  `type(e).__name__`, and log with `logger.exception`).
+- Send replies through `_safe_send()`, which retries transient network errors, skips retrying
+  non-network errors (e.g. Markdown parse failures) and always logs the final failure.
+- If the reply cannot be delivered, log it — never tell the user the business action failed.
+- Long links go into logs via `_mask_link()` (magnet `dn=` payloads are huge).
 
 ### Telegram Bot v22+ Proxy Configuration
 Both `request` and `get_updates_request` must be configured with proxy:

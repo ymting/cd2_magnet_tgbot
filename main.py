@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """
 项目名称: CloudDrive2 Telegram 离线下载管家
-版本: 1.1.7
+版本: 1.1.8
 功能描述:
     1. 链接监听: 自动识别 Magnet、HTTP、ed2k 链接并提交至 CD2 离线下载。
     2. 定时清理: 基于 Cron 表达式，递归扫描下载目录，删除小文件和黑名单文件，清理空目录。
     3. 异常容错: 增加全局错误处理与 gRPC 超时控制，防止网络波动导致假死。
     4. 轮询看门狗: 周期检测 Telegram 轮询协程是否已死亡，避免「容器活着但收不到消息」的永久静默。
+    5. 故障归因: 提交(CD2/gRPC)与回执(Telegram/httpx)分开处理，回执失败不再误报为「CD2 连接异常」。
 作者: ymting
 """
 
@@ -21,7 +22,7 @@ import clouddrive_pb2_grpc
 from datetime import datetime
 
 # 版本号
-__version__ = "1.1.7"
+__version__ = "1.1.8"
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from telegram import Update, BotCommand
@@ -333,25 +334,109 @@ async def watchdog_check(context: ContextTypes.DEFAULT_TYPE) -> None:
     application.stop_running()
 
 
+# 回执发送的最大尝试次数与退避间隔(秒)。
+# Telegram/代理侧的连接中断往往是瞬时的(重建连接即可成功)，所以值得重试；
+# 但绝不能把这类故障当成业务故障去误导用户，也不能让它不留痕迹。
+REPLY_MAX_ATTEMPTS = 3
+REPLY_RETRY_DELAY_SECONDS = 1.5
+
+
+def _mask_link(link: str, limit: int = 80) -> str:
+    """截断超长链接用于日志，避免 magnet 的 dn 参数把日志刷爆。"""
+    return link if len(link) <= limit else f"{link[:limit]}…(共 {len(link)} 字符)"
+
+
+async def _safe_send(send_func, text: str, description: str, **kwargs) -> bool:
+    """发送/编辑 Telegram 消息，遇到瞬时网络故障自动重试，且失败必留日志。
+
+    为什么要单独抽出来：
+        「提交到 CD2」走 gRPC，「给用户回执」走 Telegram(经代理)，这是两条互不相干的链路。
+        旧实现用一个 `except Exception` 把两者包在一起，于是任何发送失败都被写成
+        「❌ 提交失败，CD2 连接异常」—— 云盘里任务其实跑得好好的，用户却被误导，
+        而日志里连一行记录都没有，完全无法排查。
+
+    返回 True 表示消息最终送达。调用方必须根据返回值决定后续动作，
+    不要用「发送失败」去否定已经完成的业务动作。
+    """
+    last_error: Exception | None = None
+
+    for attempt in range(1, REPLY_MAX_ATTEMPTS + 1):
+        try:
+            await send_func(text, **kwargs)
+            return True
+        except Exception as e:
+            last_error = e
+            # 非网络异常(例如 Markdown 解析失败、消息过长)重试没有意义，立刻放弃
+            if not _is_network_error(e):
+                logger.error("❌ 【%s】发送失败(非网络异常，不重试): %s", description, e, exc_info=True)
+                return False
+
+            if attempt < REPLY_MAX_ATTEMPTS:
+                logger.warning(
+                    "⚠️ 【%s】发送失败(%d/%d)，%.1f 秒后重试: %s",
+                    description,
+                    attempt,
+                    REPLY_MAX_ATTEMPTS,
+                    REPLY_RETRY_DELAY_SECONDS,
+                    e,
+                )
+                await asyncio.sleep(REPLY_RETRY_DELAY_SECONDS)
+
+    logger.error(
+        "❌ 【%s】重试 %d 次后仍发送失败，消息未送达用户: %s",
+        description,
+        REPLY_MAX_ATTEMPTS,
+        last_error,
+        exc_info=last_error,
+    )
+    return False
+
+
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """监听并处理发送的磁力链接、HTTP、电驴链接"""
     if update.effective_user.id not in ADMIN_IDS: return
     text = update.message.text.strip()
 
-    if any(text.startswith(p) for p in ["magnet:", "http", "ed2k://"]):
-        try:
-            async with grpc.aio.insecure_channel(CD2_IP_PORT) as channel:
-                stub = clouddrive_pb2_grpc.CloudDriveFileSrvStub(channel)
-                metadata = [('authorization', f'Bearer {CD2_TOKEN}')]
-                req = clouddrive_pb2.AddOfflineFileRequest(urls=text, toFolder=SAVE_PATH)
-                res = await stub.AddOfflineFiles(req, metadata=metadata, timeout=15)
-                if res.success:
-                    await update.message.reply_text(
-                        f"✅ 提交成功！\n📂 目录：`{SAVE_PATH}`\n提示：完成后发送 /clean 执行清理。")
-                else:
-                    await update.message.reply_text(f"❌ CD2 拒绝请求: {res.errorMessage}")
-        except Exception as e:
-            await update.message.reply_text(f"❌ 提交失败，CD2 连接异常: {str(e)}")
+    if not any(text.startswith(p) for p in ["magnet:", "http", "ed2k://"]):
+        return
+
+    # ---------- 阶段一：提交到 CD2 ----------
+    # 只有这一段失败，才配称之为「CD2 连接异常」，并必须留下完整堆栈。
+    try:
+        async with grpc.aio.insecure_channel(CD2_IP_PORT) as channel:
+            stub = clouddrive_pb2_grpc.CloudDriveFileSrvStub(channel)
+            metadata = [('authorization', f'Bearer {CD2_TOKEN}')]
+            req = clouddrive_pb2.AddOfflineFileRequest(urls=text, toFolder=SAVE_PATH)
+            res = await stub.AddOfflineFiles(req, metadata=metadata, timeout=15)
+    except Exception as e:
+        logger.exception("❌ 提交 CD2 离线下载失败 [%s]: %s", type(e).__name__, _mask_link(text))
+        await _safe_send(
+            update.message.reply_text,
+            f"❌ 提交失败，CD2 连接异常: {type(e).__name__}: {e}",
+            description="CD2 连接异常回执",
+        )
+        return
+
+    if not res.success:
+        logger.warning("⚠️ CD2 拒绝离线下载请求: %s | 链接: %s", res.errorMessage, _mask_link(text))
+        await _safe_send(
+            update.message.reply_text,
+            f"❌ CD2 拒绝请求: {res.errorMessage}",
+            description="CD2 拒绝回执",
+        )
+        return
+
+    # ---------- 阶段二：回执 ----------
+    # 走到这里说明任务已经在 CD2 上跑起来了。
+    # 后续回执发不出去只能记日志，绝不能反过来告诉用户「提交失败」。
+    logger.info("✅ 已提交离线下载: %s", _mask_link(text))
+    delivered = await _safe_send(
+        update.message.reply_text,
+        f"✅ 提交成功！\n📂 目录：`{SAVE_PATH}`\n提示：完成后发送 /clean 执行清理。",
+        description="提交成功回执",
+    )
+    if not delivered:
+        logger.error("❗ 任务已在 CD2 提交成功，但成功回执未能送达用户，链接: %s", _mask_link(text))
 
 
 async def cmd_clean(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -373,11 +458,31 @@ async def cmd_clean(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             res = await clean_task_folder(stub, metadata, f.fullPathName)
                             if res: results.append(res)
             logger.info(f"📂 SAVE_PATH 下共发现 {dir_count} 个子目录")
-
-        report = "\n".join(results) if results else "✅ 下载目录非常整洁，无需清理。"
-        await status_msg.edit_text(f"📊 **清理报告：**\n{report}", parse_mode='Markdown')
     except Exception as e:
-        await status_msg.edit_text(f"❌ 无法执行清理: `{str(e)}`")
+        # 这里同样只兜住 CD2 侧的失败，日志要留全，避免「清理失败」变成无迹可查的悬案
+        logger.exception("❌ 扫描/清理失败 [%s]: %s", type(e).__name__, e)
+        await _safe_send(
+            status_msg.edit_text,
+            f"❌ 无法执行清理: `{type(e).__name__}: {e}`",
+            description="清理失败回执",
+            parse_mode='Markdown',
+        )
+        return
+
+    # 报告发送独立于清理流程：报告发不出去不代表清理失败，反过来也一样
+    report = "\n".join(results) if results else "✅ 下载目录非常整洁，无需清理。"
+    # 报告里会带文件名，Markdown 特殊字符可能让 Telegram 解析失败，失败时降级为纯文本重发
+    if not await _safe_send(
+        status_msg.edit_text,
+        f"📊 **清理报告：**\n{report}",
+        description="清理报告(Markdown)",
+        parse_mode='Markdown',
+    ):
+        await _safe_send(
+            status_msg.edit_text,
+            f"📊 清理报告：\n{report}",
+            description="清理报告(纯文本降级)",
+        )
 
 
 async def cmd_blacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
