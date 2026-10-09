@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """
 项目名称: CloudDrive2 Telegram 离线下载管家
-版本: 1.1.8
+版本: 1.1.9
 功能描述:
     1. 链接监听: 自动识别 Magnet、HTTP、ed2k 链接并提交至 CD2 离线下载。
     2. 定时清理: 基于 Cron 表达式，递归扫描下载目录，删除小文件和黑名单文件，清理空目录。
     3. 异常容错: 增加全局错误处理与 gRPC 超时控制，防止网络波动导致假死。
     4. 轮询看门狗: 周期检测 Telegram 轮询协程是否已死亡，避免「容器活着但收不到消息」的永久静默。
     5. 故障归因: 提交(CD2/gRPC)与回执(Telegram/httpx)分开处理，回执失败不再误报为「CD2 连接异常」。
+    6. 拒绝提示口语化: CD2 拒绝请求(含重复提交)时不再直接转发技术性 errorMessage，改为归类成简短人话。
 作者: ymting
 """
 
@@ -22,7 +23,7 @@ import clouddrive_pb2_grpc
 from datetime import datetime
 
 # 版本号
-__version__ = "1.1.8"
+__version__ = "1.1.9"
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from telegram import Update, BotCommand
@@ -346,6 +347,73 @@ def _mask_link(link: str, limit: int = 80) -> str:
     return link if len(link) <= limit else f"{link[:limit]}…(共 {len(link)} 字符)"
 
 
+# ---------------------------------------------------------------------------
+# CD2 拒绝请求时的「人话化」文案
+# ---------------------------------------------------------------------------
+# 为什么需要这一层：
+#   CD2 的 FileOperationResult.errorMessage 是面向开发者的描述，实际内容
+#   经常夹带云盘 API 原文（英文、错误码、内部字段名，甚至是整段 JSON）。
+#   之前是原样转发 ——「❌ CD2 拒绝请求: <一大串技术描述>」，用户看完仍然
+#   不知道发生了什么，而其中最常见的一种情况其实就是「这个链接重复提交了」。
+#   现在按关键词归类成几种简短提示，完整原文一律只写进日志备查。
+DUPLICATE_REPLY = "⚠️ 这个链接之前已经提交过了，无需重复提交。"
+
+# 全部小写保存，比较时统一对 errorMessage 做 lower()，中英文关键词即可共用一套判断。
+_DUPLICATE_HINTS = (
+    "已存在", "已经存在", "已在", "已添加", "已经添加", "已提交", "已经提交",
+    "已收录", "已下载", "已离线", "重复",
+    "already exist", "already add", "already been", "already in", "has been added",
+    "duplicate", "task exist", "task already", "in the list",
+)
+_AUTH_HINTS = (
+    "token", "unauthenticated", "unauthorized", "permission denied",
+    "invalid credential", "认证", "授权", "无权限",
+)
+_UNSUPPORTED_HINTS = (
+    "not support", "unsupported", "invalid url", "不支持", "无法解析",
+)
+
+# 剥掉 CD2 常见的动作前缀，避免「添加离线下载任务失败: xxx」这类无信息量的重复措辞占满屏幕
+_REJECT_PREFIXES = (
+    "添加离线下载任务失败:", "添加离线任务失败:", "添加离线文件失败:",
+    "离线下载失败:", "添加任务失败:",
+    "add offline file failed:", "failed to add offline file:", "addofflinefiles failed:",
+)
+
+# 未归类错误最多展示的字符数，超出部分截断（完整原文仍在日志里）
+_REJECT_TEXT_LIMIT = 80
+
+
+def _friendly_reject_reason(raw_message: str) -> str:
+    """把 CD2 返回的原始 errorMessage 转成用户看得懂的简短提示。
+
+    返回的文案已经自带 emoji 前缀，调用方直接发给用户即可。
+    识别不出类别的错误只做「去前缀 + 截断」，不会丢信息 —— 原文完整记录在日志中。
+    """
+    text = (raw_message or "").strip()
+    lowered = text.lower()
+
+    if any(hint in lowered for hint in _DUPLICATE_HINTS):
+        return DUPLICATE_REPLY
+    if any(hint in lowered for hint in _AUTH_HINTS):
+        return "❌ 提交失败：CD2 授权失效，请检查 CD2_TOKEN 是否有效。"
+    if any(hint in lowered for hint in _UNSUPPORTED_HINTS):
+        return "❌ 提交失败：CD2 不支持这个链接（格式无法解析或网盘不支持离线下载）。"
+
+    if not text:
+        # CD2 只回了 success=false 却没给原因，不能让用户对着空白猜
+        return "❌ 提交失败：CD2 未说明原因，请稍后在 CloudDrive2 中确认任务状态。"
+
+    for prefix in _REJECT_PREFIXES:
+        if lowered.startswith(prefix):
+            text = text[len(prefix):].strip()
+            break
+
+    if len(text) > _REJECT_TEXT_LIMIT:
+        text = text[:_REJECT_TEXT_LIMIT].rstrip() + "…"
+    return f"❌ 提交失败：{text}"
+
+
 async def _safe_send(send_func, text: str, description: str, **kwargs) -> bool:
     """发送/编辑 Telegram 消息，遇到瞬时网络故障自动重试，且失败必留日志。
 
@@ -418,10 +486,12 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not res.success:
+        # 原始 errorMessage 只进日志：它是面向开发者的描述，原样转发给用户既看不懂也容易吓人。
+        # 用户侧统一走 _friendly_reject_reason 归类后的简短提示。
         logger.warning("⚠️ CD2 拒绝离线下载请求: %s | 链接: %s", res.errorMessage, _mask_link(text))
         await _safe_send(
             update.message.reply_text,
-            f"❌ CD2 拒绝请求: {res.errorMessage}",
+            _friendly_reject_reason(res.errorMessage),
             description="CD2 拒绝回执",
         )
         return

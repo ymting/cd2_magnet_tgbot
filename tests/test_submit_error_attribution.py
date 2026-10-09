@@ -124,8 +124,8 @@ class SubmitErrorAttributionTests(unittest.TestCase):
             f"回执丢失必须留日志，实际: {logs.output}",
         )
 
-    def test_cd2_rejection_keeps_original_message(self):
-        """CD2 明确拒绝：原样转达 errorMessage，不要伪装成连接异常。"""
+    def test_cd2_duplicate_rejection_is_friendly(self):
+        """CD2 判定重复提交：转成人话，不把技术性 errorMessage 甩给用户。"""
         stub = SimpleNamespace(
             AddOfflineFiles=AsyncMock(
                 return_value=SimpleNamespace(success=False, errorMessage="任务已存在")
@@ -133,11 +133,21 @@ class SubmitErrorAttributionTests(unittest.TestCase):
         )
         update, reply_text = _make_update()
 
-        self._run_with_stub(stub, update)
+        with self.assertLogs("main", level="WARNING") as logs:
+            self._run_with_stub(stub, update)
 
+        # 简化的是用户侧文案，排查用的原始 errorMessage 必须完整留在日志里
+        self.assertTrue(
+            any("任务已存在" in line for line in logs.output),
+            f"原始 errorMessage 应写进日志，实际: {logs.output}",
+        )
         self.assertEqual(reply_text.await_count, 1)
-        self.assertIn("CD2 拒绝请求", reply_text.await_args.args[0])
-        self.assertIn("任务已存在", reply_text.await_args.args[0])
+        message = reply_text.await_args.args[0]
+        self.assertEqual(message, main.DUPLICATE_REPLY)
+        # 原始 errorMessage 不得出现在用户看到的文案里
+        self.assertNotIn("任务已存在", message)
+        # 但也绝不能伪装成连接异常
+        self.assertNotIn("连接异常", message)
 
     def test_non_cd2_success_still_replies_success(self):
         """正常路径不能被重构破坏。"""

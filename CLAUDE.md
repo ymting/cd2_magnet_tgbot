@@ -47,7 +47,7 @@ Integration behavior still requires `python main.py` against a live CloudDrive2 
 All business logic resides in `main.py` (~580 lines; version string in `__version__`). The code is organized into 4 commented sections (referenced by function name since line numbers drift):
 1. **Variable Configuration**: env vars → module constants (note the renames, see Environment Variables below)
 2. **Core Cleanup Logic**: `get_blacklist()`, `get_all_items_recursive()`, `is_directory_empty()`, `clean_task_folder()`, `run_auto_clean()`
-3. **Telegram Handlers**: `error_handler()`, `_get_polling_task()`, `watchdog_check()`, `_mask_link()`, `_safe_send()`, `handle_link()`, `cmd_clean()`, `cmd_blacklist()`, `post_init()`
+3. **Telegram Handlers**: `error_handler()`, `_get_polling_task()`, `watchdog_check()`, `_mask_link()`, `_friendly_reject_reason()`, `_safe_send()`, `handle_link()`, `cmd_clean()`, `cmd_blacklist()`, `post_init()`
 4. **Entry Point** (`__main__`): proxy/`HTTPXRequest` setup, `ApplicationBuilder` wiring, `run_polling()`
 
 ### Key Components
@@ -83,6 +83,21 @@ Convention:
   non-network errors (e.g. Markdown parse failures) and always logs the final failure.
 - If the reply cannot be delivered, log it — never tell the user the business action failed.
 - Long links go into logs via `_mask_link()` (magnet `dn=` payloads are huge).
+
+### User-Facing Rejection Messages (v1.1.9+)
+`FileOperationResult.errorMessage` is written for developers and often carries raw cloud-drive
+API text (English, error codes, even JSON). **Never forward it verbatim to the user.** Pass it
+through `_friendly_reject_reason()`, which classifies the message into a short human reply:
+- duplicate task (`已存在` / `already exist` / `duplicate` …) → `DUPLICATE_REPLY`, the most
+  common case, since re-sending a link is reported by CD2 as a rejection;
+- auth / permission → tell the user to check `CD2_TOKEN`;
+- unsupported link → say CD2 cannot handle that link;
+- anything else → strip CD2 action prefixes, truncate to `_REJECT_TEXT_LIMIT`, prefix with
+  `❌ 提交失败：`.
+
+The raw message must always stay in the log (`logger.warning`) — simplification applies to the
+Telegram reply only. Adding a new category means adding keywords to the hint tuples and a test
+in `tests/test_reject_message_format.py`.
 
 ### Telegram Bot v22+ Proxy Configuration
 Both `request` and `get_updates_request` must be configured with proxy:
