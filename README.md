@@ -1,6 +1,6 @@
 # CloudDrive2 Telegram 下载管理器
 
-**版本: 1.1.10-1 (dev 预发布)**
+**版本: 1.1.10-2 (dev 预发布)**
 
 项目简介：
 这是一个专为 CloudDrive2 (CD2) 开发的 Telegram 机器人助手。它能够接收磁力链接、HTTP 链接及 ed2k 链接，并自动提交至 CD2 执行离线下载，同时提供强大的自动化后期清理功能。
@@ -77,36 +77,52 @@ services:
     container_name: tg_cd2_manager
     restart: always
     volumes:
-      - ./blacklist.txt:/app/blacklist.txt  # 持久化黑名单文件
-    environment:
-      - CD2_ADDRESS=192.168.31.224:19798    # CloudDrive2 的 gRPC 地址
-      - CD2_TOKEN=你的_CD2_API_TOKEN         # CD2 设置中获取的 Token
-      - TG_TOKEN=你的_机器人_TOKEN           # 从 @BotFather 获取的 Token
-      - SAVE_PATH=/115/离线下载              # 下载保存的根目录
-      - ADMIN_IDS=1234567,8901234            # 管理员数字 ID，多个用逗号隔开
-      - SIZE_THRESHOLD=300                   # 判定垃圾任务的体积阈值 (MB)
-      - PROXY_URL=http://192.168.31.10:7890  # 可选：访问 Telegram 的代理地址
-      - NETWORK_ERROR_RESET_SECONDS=300      # 网络异常静默多久后重新计数（秒），仅用于日志诊断
-      - WATCHDOG_INTERVAL_SECONDS=60         # 轮询看门狗周期（秒）：默认开启，不需要此功能就设为 0
-      - CLEAN_CRON=30 3 * * *                # 定时清理任务的 Cron 表达式（默认每天 03:30）
+      # 可选：把黑名单挂到宿主机，容器重建后仍保留你添加的关键词；
+      # 不挂载则黑名单只存在容器里，重建后恢复为默认列表
+      - ./blacklist.txt:/app/blacklist.txt
 
+    environment:
+      # ==================== 必填项（缺一不可） ====================
+      - CD2_ADDRESS=192.168.31.224:19798     # CloudDrive2 的 gRPC 地址，格式 IP:端口
+      - CD2_TOKEN=你的_CD2_API_TOKEN         # CloudDrive2 设置里获取的 API Token
+      - TG_TOKEN=你的_机器人_TOKEN           # 从 @BotFather 获取的机器人 Token
+      - ADMIN_IDS=1234567,8901234            # 允许操作的用户数字 ID，多个用英文逗号分隔
+
+      # ==================== 可选项（放最后；不配置就用下面注释里的默认值） ====================
+      - SAVE_PATH=/115/离线下载              # 可选，默认 /115/离线下载；离线下载存放的根目录
+      - SIZE_THRESHOLD=300                   # 可选，默认 300；小于该体积(MB)的文件会被清理删除
+      - CLEAN_CRON=30 3 * * *                # 可选，默认 30 3 * * *（每天 03:30）；定时清理的 Cron 表达式
+      - WATCHDOG_INTERVAL_SECONDS=60         # 可选，默认 60；轮询看门狗检查周期(秒)，设为 0 关闭看门狗
+      - NETWORK_ERROR_RESET_SECONDS=300      # 可选，默认 300；网络异常静默多久后重新计数(秒)，仅用于日志诊断
+      - PROXY_URL=                           # 可选，默认留空=直连；访问 Telegram 的代理，支持 http/socks5
 ```
+
+> 上面「可选项」每行都写了不配置时的默认值，**用不到的直接删掉那一行即可**，效果与保留默认值完全相同。
+> 想测试开发版镜像，把 `image` 换成 `ghcr.io/ymting/cd2_magnet_tgbot:dev-<版本号>`（例如 `dev-1.1.10-1`），详见上方「分支与版本约定」。
+
 ---
 
 ## 📖 环境变量详细说明
 
-| 变量名            | 必填 | 默认值 | 描述 |
-|:---------------|:---| :--- | :--- |
-| CD2_ADDRESS    | 是  | 127.0.0.1:19798 | CloudDrive2 的 IP 和 gRPC 端口 |
-| CD2_TOKEN      | 是  | - | CloudDrive2 API 的 Access Token |
-| TG_TOKEN       | 是  | - | Telegram Bot 的 API Token |
-| ADMIN_IDS      | 是  | - | 允许使用机器人的用户数字 ID，逗号分隔 |
-| SAVE_PATH      | 否  | /115/离线下载 | 离线下载任务存放的根路径 |
-| SIZE_THRESHOLD | 否  | 300 | 文件体积小于此值(MB)将被删除，大于等于此值时检查黑名单 |
-| PROXY_URL      | 否  | - | 连接 Telegram 的代理，支持 http/socks5 |
-| NETWORK_ERROR_RESET_SECONDS | 否 | 300 | 网络异常静默达到此秒数后开始新一轮计数，仅用于日志诊断 |
-| WATCHDOG_INTERVAL_SECONDS | 否 | 60 | 轮询看门狗的检查周期（秒），设为 0 可关闭看门狗 |
-| CLEAN_CRON     | 否  |  30 3 * * * | 定时清理任务的 Cron 表达式|
+### 必填项（缺一不可）
+
+| 变量名 | 默认值 | 描述 |
+|:---|:---|:---|
+| CD2_ADDRESS | 127.0.0.1:19798 | CloudDrive2 的 IP 和 gRPC 端口 |
+| CD2_TOKEN | 无 | CloudDrive2 API 的 Access Token，留空则所有 CD2 调用都会失败 |
+| TG_TOKEN | 无 | Telegram Bot 的 API Token，留空则机器人无法启动 |
+| ADMIN_IDS | 无 | 允许操作的用户数字 ID，逗号分隔；留空则任何人都用不了 |
+
+### 可选项（不配置即使用默认值，用不到可以直接删掉对应的行）
+
+| 变量名 | 不配置时的默认值 | 描述 |
+|:---|:---|:---|
+| SAVE_PATH | `/115/离线下载` | 离线下载任务存放的根路径 |
+| SIZE_THRESHOLD | `300` | 文件体积小于此值(MB)将被删除，大于等于此值时检查黑名单 |
+| CLEAN_CRON | `30 3 * * *` | 定时清理任务的 Cron 表达式（默认每天 03:30） |
+| WATCHDOG_INTERVAL_SECONDS | `60` | 轮询看门狗的检查周期（秒），设为 `0` 可关闭看门狗 |
+| NETWORK_ERROR_RESET_SECONDS | `300` | 网络异常静默达到此秒数后开始新一轮计数，仅用于日志诊断 |
+| PROXY_URL | 空（直连，不走代理） | 连接 Telegram 的代理，支持 http/socks5 |
 
 
 ---
@@ -121,6 +137,14 @@ services:
 ---
 
 ## 🛠️ 更新日志
+
+### v1.1.10-2 (dev 预发布，未发生产)
+* **配置模板更清晰**：`docker-compose.yml` 与 README 的 compose 示例统一改为「必填项在前、可选项在后」，
+  每个可选项都标注了**不配置时的默认值**（默认值逐条与 `main.py` 的 `os.getenv` 核对过），用不到的直接删行即可。
+* **修掉示例里的代理占位值**：`PROXY_URL` 原先写死 `http://192.168.31.10:7890`（作者内网的示例地址），
+  直接照抄会让机器人去连一个不存在的代理；现改为留空，并在注释里说明「留空 = 直连」。
+* **文档补一句黑名单挂载是可选**：不挂载卷则黑名单只存在容器内，重建后恢复默认列表。
+* 环境变量说明表格拆成「必填项 / 可选项」两张表，可选项表的列名直接叫「不配置时的默认值」。
 
 ### v1.1.10-1 (dev 预发布，未发生产)
 * **修复 v1.1.9 漏掉的路径**：重复提交链接时仍会看到一大段技术报错，形如
