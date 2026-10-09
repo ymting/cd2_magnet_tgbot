@@ -1,6 +1,13 @@
 services:
   cd2-bot:
-    build: .
+    # 直接拉 GHCR 上的正式镜像：升级用 docker compose pull && docker compose up -d 即可。
+    # 注意：用 image 时服务器不需要源码和 Dockerfile，也不占本地构建资源。
+    image: ghcr.io/ymting/cd2_magnet_tgbot:latest
+    # 想测开发版镜像：注释掉上面一行，改用下面这行（dev-latest 跟随 dev 分支最新提交）
+    # image: ghcr.io/ymting/cd2_magnet_tgbot:dev-latest
+    # 想在服务器上用本地源码构建：改成 build: .（此时必须 git pull && docker compose up -d --build，
+    # 少了 --build 会继续用旧镜像，表现为「代码更新了但机器人还是老行为」）
+    # build: .
     container_name: cd2_tg_bot
     restart: always
     volumes:

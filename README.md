@@ -1,6 +1,6 @@
 # CloudDrive2 Telegram 下载管理器
 
-**版本: 1.1.10-2 (dev 预发布)**
+**版本: 1.1.10-3 (dev 预发布)**
 
 项目简介：
 这是一个专为 CloudDrive2 (CD2) 开发的 Telegram 机器人助手。它能够接收磁力链接、HTTP 链接及 ed2k 链接，并自动提交至 CD2 执行离线下载，同时提供强大的自动化后期清理功能。
@@ -74,7 +74,7 @@ git tag v1.1.10 && git push origin v1.1.10   # 触发正式镜像 + Release
 services:
   cd2-bot:
     image: ghcr.io/ymting/cd2_magnet_tgbot:latest
-    container_name: tg_cd2_manager
+    container_name: cd2_tg_bot
     restart: always
     volumes:
       # 可选：把黑名单挂到宿主机，容器重建后仍保留你添加的关键词；
@@ -98,7 +98,22 @@ services:
 ```
 
 > 上面「可选项」每行都写了不配置时的默认值，**用不到的直接删掉那一行即可**，效果与保留默认值完全相同。
-> 想测试开发版镜像，把 `image` 换成 `ghcr.io/ymting/cd2_magnet_tgbot:dev-<版本号>`（例如 `dev-1.1.10-1`），详见上方「分支与版本约定」。
+> 想测试开发版镜像，把 `image` 换成 `ghcr.io/ymting/cd2_magnet_tgbot:dev-<版本号>`（例如 `dev-1.1.10-2`），详见上方「分支与版本约定」。
+
+### 升级 / 回滚
+
+```bash
+docker compose pull && docker compose up -d     # image 方式：拉新镜像并重建容器
+```
+
+用 `image:` 时服务器上**不需要源码和 Dockerfile**，也不占本地构建资源。如果改用 `build: .` 在服务器本地构建，
+命令必须带上 `--build`：
+
+```bash
+git pull && docker compose up -d --build
+```
+
+**少了 `--build` 会继续使用旧镜像** —— 表现为「代码明明更新了，机器人行为却没变」，这个坑很难自己发现。
 
 ---
 
@@ -137,6 +152,14 @@ services:
 ---
 
 ## 🛠️ 更新日志
+
+### v1.1.10-3 (dev 预发布，未发生产)
+* **修掉 compose 里的 `build: .`**：仓库根 `docker-compose.yml` 原本写的是本地构建，而文档里写的升级方式是
+  `docker compose pull` —— **两者对不上**，照文档做会拉到空、照文件做又必须记得加 `--build`。
+  现统一改为 `image: ghcr.io/ymting/cd2_magnet_tgbot:latest`，与 README 示例一致；
+  本地构建与 dev 测试镜像都以注释形式保留在文件里。
+* **统一容器名**：README 示例里的 `tg_cd2_manager` 与根 compose 的 `cd2_tg_bot` 不一致，现统一为 `cd2_tg_bot`。
+* **文档补「升级 / 回滚」小节**：明确 `--build` 漏了会继续用旧镜像这个坑。
 
 ### v1.1.10-2 (dev 预发布，未发生产)
 * **配置模板更清晰**：`docker-compose.yml` 与 README 的 compose 示例统一改为「必填项在前、可选项在后」，
