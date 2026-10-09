@@ -4,6 +4,11 @@ memory/
 # 说明文档与临时资料 - 不上传到 GitHub
 /docs/
 
+# 本地 AI 协作规范 - 不上传到 GitHub
+# AGENTS.md 与 memory/、docs/ 同类：属于本机开发资料，不随仓库分发。
+# 用规则拦住而不只是「记得不要 git add」，避免某次 git add . 把它带进版本库。
+AGENTS.md
+
 # Python 缓存与字节码
 __pycache__/
 *.py[cod]
