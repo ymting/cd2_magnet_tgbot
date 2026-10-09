@@ -1,14 +1,15 @@
 # -*- coding: utf-8 -*-
 """
 项目名称: CloudDrive2 Telegram 离线下载管家
-版本: 1.1.9
+版本: 1.1.10-1 (dev 预发布；生产发版时改为 1.1.10)
 功能描述:
     1. 链接监听: 自动识别 Magnet、HTTP、ed2k 链接并提交至 CD2 离线下载。
     2. 定时清理: 基于 Cron 表达式，递归扫描下载目录，删除小文件和黑名单文件，清理空目录。
     3. 异常容错: 增加全局错误处理与 gRPC 超时控制，防止网络波动导致假死。
     4. 轮询看门狗: 周期检测 Telegram 轮询协程是否已死亡，避免「容器活着但收不到消息」的永久静默。
     5. 故障归因: 提交(CD2/gRPC)与回执(Telegram/httpx)分开处理，回执失败不再误报为「CD2 连接异常」。
-    6. 拒绝提示口语化: CD2 拒绝请求(含重复提交)时不再直接转发技术性 errorMessage，改为归类成简短人话。
+    6. 拒绝提示口语化: CD2 的业务拒绝(含重复提交)不再转发技术性报错，改为归类成简短人话。
+       覆盖两条路径: gRPC 抛异常(115open 把重复链接报成 INTERNAL)与 res.success=False。
 作者: ymting
 """
 
@@ -23,7 +24,9 @@ import clouddrive_pb2_grpc
 from datetime import datetime
 
 # 版本号
-__version__ = "1.1.9"
+# 版本号。唯一来源：CI 直接从这里读取并生成镜像标签（见 docker-publish.yml）。
+# 约定：master 上是生产版本（如 1.1.10），dev 分支上带 -n 后缀（如 1.1.10-1、1.1.10-2）。
+__version__ = "1.1.10-1"
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from telegram import Update, BotCommand
@@ -207,8 +210,9 @@ async def clean_task_folder(stub, metadata, folder_path) -> str | None:
         return f"🧹 已从 `{folder_name}` 中移除 {delete_count} 个小文件。" if delete_count > 0 else None
 
     except Exception as e:
-        logger.error(f"处理文件夹 {folder_name} 出错: {str(e)}")
-        return f"❌ 处理 `{folder_name}` 异常: {str(e)}"
+        # 日志留全；报告里只放一行摘要，否则 AioRpcError 的整段 repr 会把 Telegram 消息撑爆
+        logger.error("❌ 处理文件夹 %s 出错: %s", folder_name, e, exc_info=True)
+        return f"❌ 处理 `{folder_name}` 出错：{_shorten(_grpc_error_raw(e))}"
 
 
 async def run_auto_clean():
@@ -348,17 +352,21 @@ def _mask_link(link: str, limit: int = 80) -> str:
 
 
 # ---------------------------------------------------------------------------
-# CD2 拒绝请求时的「人话化」文案
+# 失败原因「人话化」文案
 # ---------------------------------------------------------------------------
 # 为什么需要这一层：
-#   CD2 的 FileOperationResult.errorMessage 是面向开发者的描述，实际内容
-#   经常夹带云盘 API 原文（英文、错误码、内部字段名，甚至是整段 JSON）。
-#   之前是原样转发 ——「❌ CD2 拒绝请求: <一大串技术描述>」，用户看完仍然
-#   不知道发生了什么，而其中最常见的一种情况其实就是「这个链接重复提交了」。
-#   现在按关键词归类成几种简短提示，完整原文一律只写进日志备查。
+#   CD2 的技术性报错会从**两条路**到达用户，两条都必须拦：
+#     (a) gRPC 直接抛异常 —— 云盘侧的拒绝被 CD2 包成 gRPC 错误码抛出。
+#         实测 115open 对重复链接返回的是 StatusCode.INTERNAL + code 10008 +
+#         「任务已存在，请勿输入重复的链接地址」，而不是 success=False。
+#         这条路的异常 repr 有 4 行（status / details / debug_error_string），
+#         且 details 与 debug_error_string 内容重复，直接展示既长又难读。
+#     (b) res.success == False + errorMessage —— 面向开发者的描述，常夹带
+#         云盘 API 原文、错误码、JSON。
+#   两条路统一按关键词归类成简短提示；完整原文一律只写进日志备查。
 DUPLICATE_REPLY = "⚠️ 这个链接之前已经提交过了，无需重复提交。"
 
-# 全部小写保存，比较时统一对 errorMessage 做 lower()，中英文关键词即可共用一套判断。
+# 全部小写保存，比较时统一对报错文本做 lower()，中英文关键词即可共用一套判断。
 _DUPLICATE_HINTS = (
     "已存在", "已经存在", "已在", "已添加", "已经添加", "已提交", "已经提交",
     "已收录", "已下载", "已离线", "重复",
@@ -383,14 +391,67 @@ _REJECT_PREFIXES = (
 # 未归类错误最多展示的字符数，超出部分截断（完整原文仍在日志里）
 _REJECT_TEXT_LIMIT = 80
 
+# 只有这些 gRPC 状态码才是「真的连不上 CD2」，才允许说「CD2 连接异常」。
+# 特别注意：INTERNAL 不算 —— 云盘 API 的业务拒绝（如 115open 的 10008 重复任务）
+# 也是以 INTERNAL 抛出的，把它说成「连接异常」正是上一版残留的误报。
+_TRANSPORT_STATUS_CODES = ("StatusCode.UNAVAILABLE", "StatusCode.DEADLINE_EXCEEDED")
+_TRANSPORT_TEXT_HINTS = (
+    "unavailable", "deadline exceeded", "connection refused",
+    "failed to connect", "no route to host", "timed out", "connect failed",
+)
 
-def _friendly_reject_reason(raw_message: str) -> str:
-    """把 CD2 返回的原始 errorMessage 转成用户看得懂的简短提示。
 
-    返回的文案已经自带 emoji 前缀，调用方直接发给用户即可。
-    识别不出类别的错误只做「去前缀 + 截断」，不会丢信息 —— 原文完整记录在日志中。
+def _shorten(text: str, limit: int = _REJECT_TEXT_LIMIT) -> str:
+    """把一段文本压成单行并截断，避免多行技术描述或超长报文甩给用户。
+
+    先做单行化（把换行/连续空格归一）再截断 —— AioRpcError 的 repr 是 4 行，
+    不压行的话 Telegram 里会出现大段堆栈样式的内容。
+    """
+    text = " ".join((text or "").split())
+    return text if len(text) <= limit else text[:limit].rstrip() + "…"
+
+
+def _grpc_error_raw(error: BaseException) -> str:
+    """取出异常里最有价值的一段文本，优先 AioRpcError.details()。
+
+    AioRpcError 的 str() 包含 status / details / debug_error_string 三段，
+    而 debug_error_string 与 details 基本是同一份内容，展示价值为零。
+    details() 恰好只给业务原因（例如「code: 10008, message: 任务已存在…」），
+    既短又能直接用于归类。
+    """
+    details = getattr(error, "details", None)
+    if callable(details):
+        try:
+            text = (details() or "").strip()
+            if text:
+                return text
+        except Exception:
+            # 某些异常对象的 details 可能抛错，静默退回 str()，不能因此再抛一层
+            pass
+    return str(error).strip()
+
+
+def _is_transport_failure(error: BaseException) -> bool:
+    """判断异常是否属于「连不上 CD2」这类真正的传输层故障。"""
+    code = getattr(error, "code", None)
+    if callable(code):
+        try:
+            return str(code()) in _TRANSPORT_STATUS_CODES
+        except Exception:
+            pass
+    lowered = str(error).lower()
+    return any(hint in lowered for hint in _TRANSPORT_TEXT_HINTS)
+
+
+def _classify_reject_reason(raw_message: str) -> str | None:
+    """识别报错文本属于哪类已知拒绝；识别不出返回 None，由调用方兜底。
+
+    单独抽出来是为了让两条路径共用同一套判断：
+    gRPC 异常走 _describe_submit_failure()，success=False 走 _friendly_reject_reason()。
     """
     text = (raw_message or "").strip()
+    if not text:
+        return None
     lowered = text.lower()
 
     if any(hint in lowered for hint in _DUPLICATE_HINTS):
@@ -399,19 +460,51 @@ def _friendly_reject_reason(raw_message: str) -> str:
         return "❌ 提交失败：CD2 授权失效，请检查 CD2_TOKEN 是否有效。"
     if any(hint in lowered for hint in _UNSUPPORTED_HINTS):
         return "❌ 提交失败：CD2 不支持这个链接（格式无法解析或网盘不支持离线下载）。"
+    return None
 
+
+def _friendly_reject_reason(raw_message: str) -> str:
+    """路径 (b)：res.success=False 时，把 errorMessage 转成用户看得懂的一句话。
+
+    识别不出类别的错误只做「去前缀 + 截断」，不会丢信息 —— 原文完整记录在日志中。
+    """
+    classified = _classify_reject_reason(raw_message)
+    if classified:
+        return classified
+
+    text = (raw_message or "").strip()
     if not text:
         # CD2 只回了 success=false 却没给原因，不能让用户对着空白猜
         return "❌ 提交失败：CD2 未说明原因，请稍后在 CloudDrive2 中确认任务状态。"
 
+    lowered = text.lower()
     for prefix in _REJECT_PREFIXES:
         if lowered.startswith(prefix):
             text = text[len(prefix):].strip()
             break
+    return f"❌ 提交失败：{_shorten(text)}"
 
-    if len(text) > _REJECT_TEXT_LIMIT:
-        text = text[:_REJECT_TEXT_LIMIT].rstrip() + "…"
-    return f"❌ 提交失败：{text}"
+
+def _describe_submit_failure(error: BaseException) -> str:
+    """路径 (a)：提交阶段抛异常时，给用户看的一句话。
+
+    分三种情况，顺序不能换：
+      1. 能归类出业务原因（重复提交 / 授权 / 不支持）→ 说人话，**不提「连接异常」**；
+      2. 真正的传输层故障（UNAVAILABLE / DEADLINE_EXCEEDED）→ 才说「CD2 连接异常」；
+      3. 其余未知错误 → 如实说失败 + 异常类型名，同样不误导成连接问题。
+    """
+    raw = _grpc_error_raw(error)
+
+    classified = _classify_reject_reason(raw)
+    if classified:
+        return classified
+
+    if _is_transport_failure(error):
+        return f"❌ 提交失败，CD2 连接异常（{type(error).__name__}）：{_shorten(raw)}"
+
+    if not raw:
+        return "❌ 提交失败：CD2 未说明原因，请稍后在 CloudDrive2 中确认任务状态。"
+    return f"❌ 提交失败（{type(error).__name__}）：{_shorten(raw)}"
 
 
 async def _safe_send(send_func, text: str, description: str, **kwargs) -> bool:
@@ -469,7 +562,9 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ---------- 阶段一：提交到 CD2 ----------
-    # 只有这一段失败，才配称之为「CD2 连接异常」，并必须留下完整堆栈。
+    # 这里的 except 只兜 gRPC 提交，日志必须留全（含堆栈）；
+    # 但用户侧只说人话 —— 云盘的业务拒绝（如 115open 的「任务已存在」）
+    # 也是以 gRPC 异常抛出的，直接展示 AioRpcError 的 4 行 repr 毫无意义。
     try:
         async with grpc.aio.insecure_channel(CD2_IP_PORT) as channel:
             stub = clouddrive_pb2_grpc.CloudDriveFileSrvStub(channel)
@@ -480,8 +575,8 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.exception("❌ 提交 CD2 离线下载失败 [%s]: %s", type(e).__name__, _mask_link(text))
         await _safe_send(
             update.message.reply_text,
-            f"❌ 提交失败，CD2 连接异常: {type(e).__name__}: {e}",
-            description="CD2 连接异常回执",
+            _describe_submit_failure(e),
+            description="CD2 提交失败回执",
         )
         return
 
@@ -529,13 +624,13 @@ async def cmd_clean(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             if res: results.append(res)
             logger.info(f"📂 SAVE_PATH 下共发现 {dir_count} 个子目录")
     except Exception as e:
-        # 这里同样只兜住 CD2 侧的失败，日志要留全，避免「清理失败」变成无迹可查的悬案
+        # 这里同样只兜住 CD2 侧的失败，日志要留全，避免「清理失败」变成无迹可查的悬案；
+        # 用户侧只给一行摘要，且不再用 Markdown（异常文本里的 _ * ` 会让解析失败）
         logger.exception("❌ 扫描/清理失败 [%s]: %s", type(e).__name__, e)
         await _safe_send(
             status_msg.edit_text,
-            f"❌ 无法执行清理: `{type(e).__name__}: {e}`",
+            f"❌ 无法执行清理（{type(e).__name__}）：{_shorten(_grpc_error_raw(e))}",
             description="清理失败回执",
-            parse_mode='Markdown',
         )
         return
 

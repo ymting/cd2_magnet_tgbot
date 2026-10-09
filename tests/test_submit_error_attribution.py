@@ -26,6 +26,39 @@ class FakeAioRpcError(Exception):
     """模拟 grpc.aio.AioRpcError，用于验证错误类型名会被带上。"""
 
 
+class FakeRpcErrorWithDetails(Exception):
+    """更接近真实的 AioRpcError：带 code() 与 details()，str() 是多行 repr。
+
+    2026-10-09 生产实测：115open 对重复链接返回的是
+        StatusCode.INTERNAL + "api error Cloud 115open(5975675) api error:
+        code: 10008, message: 任务已存在，请勿输入重复的链接地址"
+    它是**抛异常**回来的，不是 success=False，所以必须走异常路径的归类。
+    """
+
+    def __init__(self, code_name: str, details: str):
+        self._code = code_name
+        self._details = details
+        super().__init__(
+            "<AioRpcError of RPC that terminated with:\n"
+            f'status = {code_name}\n'
+            f'details = "{details}"\n'
+            f'debug_error_string = "INTERNAL:{details}"\n>'
+        )
+
+    def code(self):
+        return self._code
+
+    def details(self):
+        return self._details
+
+
+# 用户 2026-10-09 在 bot 上收到的真实报错（原文照抄）
+REAL_DUPLICATE_DETAILS = (
+    "api error Cloud 115open(5975675) api error: "
+    "code: 10008, message: 任务已存在，请勿输入重复的链接地址"
+)
+
+
 class _FakeChannel:
     """模拟 grpc.aio.insecure_channel 返回的异步上下文管理器。"""
 
@@ -124,7 +157,35 @@ class SubmitErrorAttributionTests(unittest.TestCase):
             f"回执丢失必须留日志，实际: {logs.output}",
         )
 
-    def test_cd2_duplicate_rejection_is_friendly(self):
+    def test_duplicate_via_rpc_exception_is_friendly(self):
+        """真实场景：115open 把「重复提交」以 gRPC INTERNAL 异常抛出。
+
+        这条路径上一版漏掉了 —— 用户看到的仍是 AioRpcError 的整段 repr。
+        """
+        stub = SimpleNamespace(
+            AddOfflineFiles=AsyncMock(
+                side_effect=FakeRpcErrorWithDetails("StatusCode.INTERNAL", REAL_DUPLICATE_DETAILS)
+            )
+        )
+        update, reply_text = _make_update()
+
+        with self.assertLogs("main", level="ERROR") as logs:
+            self._run_with_stub(stub, update)
+
+        self.assertEqual(reply_text.await_count, 1)
+        message = reply_text.await_args.args[0]
+        self.assertEqual(message, main.DUPLICATE_REPLY)
+        # 三样都不能再出现：多行 repr、debug_error_string、误报的「连接异常」
+        self.assertNotIn("AioRpcError", message)
+        self.assertNotIn("debug_error_string", message)
+        self.assertNotIn("连接异常", message)
+        # 原始细节必须留在日志里
+        self.assertTrue(
+            any("任务已存在" in line for line in logs.output),
+            f"原始 details 应写进日志，实际: {logs.output}",
+        )
+
+    def test_duplicate_rejection_is_friendly(self):
         """CD2 判定重复提交：转成人话，不把技术性 errorMessage 甩给用户。"""
         stub = SimpleNamespace(
             AddOfflineFiles=AsyncMock(
