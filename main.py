@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 项目名称: CloudDrive2 Telegram 离线下载管家
-版本: 1.1.10-9 (dev 预发布；生产发版时改为 1.1.10)
+版本: 1.1.10-10 (dev 预发布；生产发版时改为 1.1.10)
 功能描述:
     1. 链接监听: 自动识别 Magnet、ed2k、http(s) 直链并提交至 CD2 离线下载。
        支持一条消息里混合粘贴多个不同类型的链接，逐个提交后汇总回执。
@@ -34,7 +34,7 @@ from collections.abc import Callable
 # 版本号
 # 版本号。唯一来源：CI 直接从这里读取并生成镜像标签（见 docker-publish.yml）。
 # 约定：master 上是生产版本（如 1.1.10），dev 分支上带 -n 后缀（如 1.1.10-1、1.1.10-2）。
-__version__ = "1.1.10-9"
+__version__ = "1.1.10-10"
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from telegram import Update, BotCommand

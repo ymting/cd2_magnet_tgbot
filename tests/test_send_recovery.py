@@ -34,6 +34,10 @@ class _FakeChannel:
 class LocalTransportRecoveryTests(unittest.IsolatedAsyncioTestCase):
     """超出连接池容量的真实 TLS 失败必须仍能建立下一条连接。"""
 
+    # 本机 Windows Proactor 在故意断开 TLS 的 socket 上偶发 WinError 10022，
+    # 甚至无法完成 wait_closed；使用与 Linux 容器一致的 Selector 驱动真实 TCP 探针。
+    loop_factory = asyncio.SelectorEventLoop
+
     async def asyncSetUp(self):
         self.connect_count = 0
         self.connections = set()
@@ -79,8 +83,8 @@ class LocalTransportRecoveryTests(unittest.IsolatedAsyncioTestCase):
         finally:
             writer.close()
             try:
-                await writer.wait_closed()
-            except ConnectionError:
+                await asyncio.wait_for(writer.wait_closed(), timeout=3)
+            except (ConnectionError, asyncio.TimeoutError):
                 pass
             self.connections.discard(writer)
             self.handlers.discard(task)
@@ -92,7 +96,7 @@ class LocalTransportRecoveryTests(unittest.IsolatedAsyncioTestCase):
         for writer in list(self.connections):
             writer.close()
         if self.handlers:
-            await asyncio.gather(*list(self.handlers), return_exceptions=True)
+            await asyncio.wait_for(asyncio.gather(*list(self.handlers), return_exceptions=True), timeout=5)
 
     def _request(self, cls=main.ResilientHTTPXRequest):
         return cls(
