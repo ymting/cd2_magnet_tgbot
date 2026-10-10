@@ -33,28 +33,25 @@ python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. clouddrive.pr
 > `requirements.txt` is **unpinned**, but the proxy and `JobQueue` patterns require **python-telegram-bot v22+**. If a fresh install resolves an older major version, the bot will break (proxy API and JobQueue behavior differ).
 
 ### Tests
-Unit tests live in `tests/` and need no network access:
+Regression tests live in `tests/`. They need no Telegram or CloudDrive2 service; transport recovery tests bind a temporary localhost proxy to reproduce TLS handshake failures:
 
 ```bash
-python -m unittest tests.test_network_error_handling tests.test_polling_watchdog \
-  tests.test_token_redaction tests.test_reject_message_format \
-  tests.test_submit_error_attribution tests.test_batch_links
+python -m unittest discover -s tests -p 'test_*.py'
 ```
-> `unittest discover -s tests` fails with "Start directory is not importable" because `tests/` has no
-> `__init__.py` — list the modules explicitly.
-> When working in the repo's own virtualenv on Windows, run them as
-> `.venv/Scripts/python.exe -m unittest ...`.
+> On Windows use the project's installed dependencies:
+> `.venv/Scripts/python.exe -m unittest discover -s tests -p 'test_*.py'`.
+> Run from the repository root, so `main.py` and the generated gRPC modules are importable.
 
 Integration behavior still requires `python main.py` against a live CloudDrive2 instance (or watching `docker-compose` logs).
 
 ## Architecture
 
 ### Single-File Design
-All business logic resides in `main.py` (~910 lines; version string in `__version__`). The code is organized into 4 commented sections (referenced by function name since line numbers drift):
+All business logic resides in `main.py` (version string in `__version__`). The code is organized into 4 commented sections (referenced by function name since line numbers drift):
 1. **Variable Configuration**: env vars → module constants (note the renames, see Environment Variables below)
 2. **Core Cleanup Logic**: `get_blacklist()`, `get_all_items_recursive()`, `is_directory_empty()`, `clean_task_folder()`, `run_auto_clean()`
 3. **Telegram Handlers**: `error_handler()`, `_get_polling_task()`, `watchdog_check()`, `_mask_link()`, `_extract_links()`, `_shorten()`, `_grpc_error_raw()`, `_is_transport_failure()`, `_classify_reject_reason()`, `_friendly_reject_reason()`, `_describe_submit_failure()`, `_safe_send()`, `SubmitOutcome`, `_submit_offline_link()`, `_build_batch_report()`, `_reply_single_link()`, `_submit_batch_links()`, `handle_link()`, `cmd_clean()`, `cmd_blacklist()`, `post_init()`
-4. **Entry Point** (`__main__`): proxy/`HTTPXRequest` setup, `ApplicationBuilder` wiring, `run_polling()`
+4. **Entry Point** (`__main__`): ordinary API requests use `ResilientHTTPXRequest`; getUpdates keeps a separate `HTTPXRequest`. `ApplicationBuilder` wires both clients and `run_polling()` manages their lifecycle.
 
 ### Key Components
 
@@ -85,10 +82,47 @@ failed connection is completely silent).
 Convention:
 - Submit first, reply second. Only the submit step may report `CD2 连接异常` (include
   `type(e).__name__`, and log with `logger.exception`).
-- Send replies through `_safe_send()`, which retries transient network errors, skips retrying
-  non-network errors (e.g. Markdown parse failures) and always logs the final failure.
+- Send replies through `_safe_send()`. New messages retry only confirmed unsent failures or
+  Telegram `RetryAfter`; unknown delivery outcomes are logged without duplicating a new message.
+  Edits use `is_edit=True` because editing the same message to the same content is idempotent.
 - If the reply cannot be delivered, log it — never tell the user the business action failed.
 - Long links go into logs via `_mask_link()` (magnet `dn=` payloads are huge).
+
+### Outbound Pool Recovery and Final Receipts (v1.1.10-9+)
+
+`ResilientHTTPXRequest` serializes ordinary requests, initialization and shutdown with one
+`asyncio.Lock`. A confirmed connect/proxy/pool failure triggers `HTTPXRequest.shutdown()` and
+`initialize()` through public APIs. Rebuilding preserves constructor configuration and never
+touches the separate getUpdates client. `RequestNotSent` marks recovery failures before any API
+request was issued. `CancelledError` propagates instead of restarting the client during shutdown.
+
+`_safe_send(send_func, text, description, *, queue_on_failure=False, is_edit=False,
+failure_state=None, **kwargs)` preserves its truthy success / `None` failure contract. Final
+download receipts opt into `queue_on_failure=True`; transient progress messages do not.
+`BadRequest` inherits `NetworkError`, so `_is_network_error()` must exclude permanent Telegram
+errors before using network-type or message heuristics. `RetryAfter.retry_after` can be an integer
+or `timedelta`; never retry before that delay or bypass it by sending a replacement report.
+`BadRequest("Message is not modified")` is successful completion for edits.
+
+`PendingReply`, `_queue_pending_reply()` and `flush_pending_replies()` retain only notification
+callbacks and final text, never a CD2 submission callback. `post_init()` registers the flush on
+the built-in `JobQueue`. The queue has at most 100 items, a 3600-second TTL and 120 resend
+attempts per item; whichever limit is reached first stops delivery. A 30-second job tries at most
+5 due entries, with network backoff up to 300 seconds. In-flight entries count toward capacity
+and deduplication; cancellation preserves their queue entry. Application shutdown blocks new
+flushes. This is an in-memory queue: restarting loses pending notifications and cannot recover
+old receipts discarded by previous versions.
+
+For a new message, read/write/protocol errors or unclassified network failures mean delivery is
+unknown. Do not retry or enqueue it, because Telegram may already have accepted it. An edit
+retains the original edit callback for safe retries. `_submit_batch_links()` uses `failure_state`
+to stop immediate new-message fallback when the edit is deferred or delivery is uncertain.
+Never call `AddOfflineFiles` again while recovering Telegram delivery.
+
+`tests/test_send_recovery.py` covers real localhost proxy/TLS behavior, send/getUpdates isolation,
+request lifecycle locking, confirmed-unsent notification delivery, unknown outcomes, limit and
+TTL handling, cancellation, permanent errors, rate limits and batch-report behavior. These tests
+are isolated verification, not proof of a live production deployment.
 
 ### User-Facing Rejection Messages (v1.1.9+, extended in v1.1.10)
 Technical CD2 errors reach the user through **two independent paths** — both must be
@@ -180,7 +214,7 @@ A single message may carry **several links of mixed schemes** (magnet / ed2k / h
 Both `request` and `get_updates_request` must be configured with proxy:
 ```python
 from telegram.request import HTTPXRequest
-q_request = HTTPXRequest(proxy=PROXY_URL, connection_pool_size=8, ...)
+q_request = ResilientHTTPXRequest(proxy=PROXY_URL, connection_pool_size=8, ...)
 u_request = HTTPXRequest(proxy=PROXY_URL, ...)  # Required for getUpdates
 
 builder = ApplicationBuilder().token(TG_BOT_TOKEN).request(q_request).get_updates_request(u_request)

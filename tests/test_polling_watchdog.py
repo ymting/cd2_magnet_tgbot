@@ -131,8 +131,12 @@ class PostInitWatchdogRegistrationTests(unittest.IsolatedAsyncioTestCase):
 
         await main.post_init(application)
 
-        application.job_queue.run_repeating.assert_called_once()
-        args, kwargs = application.job_queue.run_repeating.call_args
+        watchdog_jobs = [
+            call for call in application.job_queue.run_repeating.call_args_list
+            if call.kwargs.get("name") == "polling_watchdog"
+        ]
+        self.assertEqual(len(watchdog_jobs), 1)
+        args, kwargs = watchdog_jobs[0]
         self.assertIs(args[0], main.watchdog_check)
         self.assertEqual(kwargs["interval"], main.WATCHDOG_INTERVAL_SECONDS)
         self.assertEqual(kwargs["name"], "polling_watchdog")

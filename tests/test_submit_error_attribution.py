@@ -17,9 +17,17 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import httpx
 from telegram.error import NetworkError
 
 import main
+
+
+def _connect_failure():
+    """模拟 PTB 的真实异常链，明确请求在建立连接时失败、尚未送达。"""
+    error = NetworkError("httpx.ConnectError: ")
+    error.__cause__ = httpx.ConnectError("")
+    return error
 
 
 class FakeAioRpcError(Exception):
@@ -127,7 +135,7 @@ class SubmitErrorAttributionTests(unittest.TestCase):
         )
         # 第一次发送撞上代理/Telegram 瞬时故障，第二次恢复
         update, reply_text = _make_update(
-            reply_side_effect=[NetworkError("httpx.ConnectError: "), None]
+            reply_side_effect=[_connect_failure(), None]
         )
 
         self._run_with_stub(stub, update)
@@ -145,7 +153,7 @@ class SubmitErrorAttributionTests(unittest.TestCase):
             AddOfflineFiles=AsyncMock(return_value=SimpleNamespace(success=True, errorMessage=""))
         )
         update, reply_text = _make_update(
-            reply_side_effect=NetworkError("httpx.ConnectError: ")
+            reply_side_effect=_connect_failure()
         )
 
         with self.assertLogs("main", level="ERROR") as logs:
@@ -293,13 +301,13 @@ class SafeSendTests(unittest.TestCase):
         self.assertEqual(send.await_count, 1)
 
     def test_network_error_is_retried_until_success(self):
-        send = AsyncMock(side_effect=[NetworkError("httpx.ConnectError: "), None, None])
+        send = AsyncMock(side_effect=[_connect_failure(), None, None])
         result = asyncio.run(main._safe_send(send, "hello", description="测试消息"))
         self.assertTrue(result)
         self.assertEqual(send.await_count, 2)
 
     def test_all_attempts_exhausted_returns_false(self):
-        send = AsyncMock(side_effect=NetworkError("httpx.ConnectError: "))
+        send = AsyncMock(side_effect=_connect_failure())
         with self.assertLogs("main", level="ERROR"):
             result = asyncio.run(main._safe_send(send, "hello", description="测试消息"))
         self.assertFalse(result)

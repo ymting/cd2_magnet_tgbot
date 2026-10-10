@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 项目名称: CloudDrive2 Telegram 离线下载管家
-版本: 1.1.10-8 (dev 预发布；生产发版时改为 1.1.10)
+版本: 1.1.10-9 (dev 预发布；生产发版时改为 1.1.10)
 功能描述:
     1. 链接监听: 自动识别 Magnet、ed2k、http(s) 直链并提交至 CD2 离线下载。
        支持一条消息里混合粘贴多个不同类型的链接，逐个提交后汇总回执。
@@ -13,6 +13,7 @@
     6. 拒绝提示口语化: CD2 的业务拒绝(含重复提交)不再转发技术性报错，改为归类成简短人话。
        覆盖两条路径: gRPC 抛异常(115open 把重复链接报成 INTERNAL)与 res.success=False。
        http(s) 直链被拒时单独给出指导性说明（后端网盘通常不吃直链），并附原文摘要备查。
+    7. 回执自愈: 发送连接故障自动重建普通请求池，最终通知在内存中有界补发，不重复创建下载。
 作者: ymting
 """
 
@@ -22,21 +23,24 @@ import re
 import time
 import grpc
 import asyncio
+import httpx
 import clouddrive_pb2
 import clouddrive_pb2_grpc
 from datetime import datetime
 from typing import NamedTuple
+from dataclasses import dataclass
+from collections.abc import Callable
 
 # 版本号
 # 版本号。唯一来源：CI 直接从这里读取并生成镜像标签（见 docker-publish.yml）。
 # 约定：master 上是生产版本（如 1.1.10），dev 分支上带 -n 后缀（如 1.1.10-1、1.1.10-2）。
-__version__ = "1.1.10-8"
+__version__ = "1.1.10-9"
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from telegram import Update, BotCommand
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, filters
 from telegram.request import HTTPXRequest
-from telegram.error import NetworkError, TimedOut
+from telegram.error import BadRequest, Forbidden, InvalidToken, NetworkError, TimedOut, RetryAfter
 
 # ==========================================
 # 1. 变量配置区 (从 Docker 环境变量读取)
@@ -61,6 +65,82 @@ if WATCHDOG_INTERVAL_SECONDS < 0:
 # 配置日志输出，方便在 Docker 日志中查看运行状态
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+class RequestNotSent(NetworkError):
+    """连接池恢复阶段即失败，明确还未发出 Telegram 请求。"""
+
+
+def _request_failure_cause(error: Exception) -> Exception:
+    """PTB 把 httpx 异常包装成 TelegramError；归因优先保留真正的底层类型。"""
+    return error.__cause__ or error
+
+
+def _is_unsent_failure(error: Exception) -> bool:
+    if isinstance(error, (BadRequest, Forbidden, InvalidToken)):
+        return False
+    if isinstance(error, RequestNotSent):
+        return True
+    cause = _request_failure_cause(error)
+    if isinstance(cause, (httpx.ConnectError, httpx.ConnectTimeout,
+                          httpx.ProxyError, httpx.PoolTimeout)):
+        return True
+    # 兼容 PTB 不保留 cause 的错误以及旧版测试替身；只认明确的未发送信号。
+    return any(hint in str(error) for hint in
+               ("httpx.ConnectError", "httpx.ConnectTimeout", "httpx.ProxyError", "Pool timeout:"))
+
+
+class ResilientHTTPXRequest(HTTPXRequest):
+    """普通 Telegram 请求的连接池自愈，不改变独立的 getUpdates 轮询客户端。"""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._recovery_lock = asyncio.Lock()
+        self._needs_recovery = False
+        self._shutdown = False
+
+    async def initialize(self):
+        async with self._recovery_lock:
+            await super().initialize()
+            self._shutdown = False
+
+    async def shutdown(self):
+        async with self._recovery_lock:
+            self._shutdown = True
+            await super().shutdown()
+
+    async def _recover_locked(self):
+        # 必须与整个请求共用锁：关闭旧池时不能仍有其它请求在使用它。
+        # 只调用 PTB 公共生命周期接口，保留代理、超时及所有原始构造参数。
+        await super().shutdown()
+        await super().initialize()
+        self._needs_recovery = False
+        logger.warning("🔄 Telegram 普通发送连接池已重建；接收轮询不受影响。")
+
+    async def do_request(self, *args, **kwargs):
+        async with self._recovery_lock:
+            if self._shutdown:
+                raise RuntimeError("Telegram 发送客户端已关闭")
+            if self._needs_recovery:
+                try:
+                    await self._recover_locked()
+                except Exception as error:
+                    raise RequestNotSent("Telegram 发送连接池恢复失败，请求未发送") from error
+            try:
+                return await super().do_request(*args, **kwargs)
+            except asyncio.CancelledError:
+                # TLS 握手被取消也可能留下连接占位；不阻拦取消，下一次请求先重建。
+                self._needs_recovery = True
+                raise
+            except Exception as error:
+                if _is_unsent_failure(error):
+                    self._needs_recovery = True
+                    try:
+                        await self._recover_locked()
+                    except Exception:
+                        # 恢复失败也保留原始网络异常，下次请求会先再次恢复。
+                        logger.exception("❌ Telegram 普通发送连接池重建失败，将在下次请求重试。")
+                raise
 
 
 class TokenRedactionFilter(logging.Filter):
@@ -244,6 +324,9 @@ async def run_auto_clean():
 
 def _is_network_error(error: object) -> bool:
     """识别 Telegram/httpx 抛出的可恢复网络异常。"""
+    # BadRequest 是 NetworkError 的子类，但重复坏参数永远不能修复发送。
+    if isinstance(error, (BadRequest, Forbidden, InvalidToken)):
+        return False
     error_text = str(error)
     return (
         isinstance(error, (NetworkError, TimedOut))
@@ -348,6 +431,12 @@ async def watchdog_check(context: ContextTypes.DEFAULT_TYPE) -> None:
 # 但绝不能把这类故障当成业务故障去误导用户，也不能让它不留痕迹。
 REPLY_MAX_ATTEMPTS = 3
 REPLY_RETRY_DELAY_SECONDS = 1.5
+REPLY_RATE_LIMIT_WAIT_SECONDS = 5
+PENDING_REPLY_MAX_ITEMS = 100
+PENDING_REPLY_TTL_SECONDS = 3600
+PENDING_REPLY_INTERVAL_SECONDS = 30
+PENDING_REPLY_MAX_ATTEMPTS = 120
+PENDING_REPLY_BATCH_SIZE = 5
 
 
 def _mask_link(link: str, limit: int = 80) -> str:
@@ -705,7 +794,121 @@ def _describe_submit_failure(error: BaseException, link: str | None = None) -> s
     return f"❌ 提交失败（{type(error).__name__}）：{_shorten(raw)}"
 
 
-async def _safe_send(send_func, text: str, description: str, **kwargs):
+@dataclass
+class PendingReply:
+    """只保存原通知，不保存下载动作；进程退出后内存队列随之丢失。"""
+
+    send_func: Callable
+    text: str
+    description: str
+    kwargs: dict
+    expires_at: float
+    next_attempt_at: float
+    attempts: int = 0
+    is_edit: bool = False
+
+
+_pending_replies: list[PendingReply] = []
+_pending_flush_running = False
+_pending_active_reply: PendingReply | None = None
+
+
+def _retry_after_seconds(error: RetryAfter) -> float:
+    delay = error.retry_after
+    return max(0.0, delay.total_seconds() if hasattr(delay, "total_seconds") else float(delay))
+
+
+def _queue_pending_reply(send_func, text, description, kwargs, *, delay=0.0, is_edit=False):
+    now = time.monotonic()
+    _pending_replies[:] = [item for item in _pending_replies
+                           if item.expires_at > now or item is _pending_active_reply]
+    # 同一条原消息、同一份通知不能重复入队；不同用户消息仍各有自己的回执。
+    for item in _pending_replies:
+        if item.send_func == send_func and item.text == text and item.kwargs == kwargs:
+            item.next_attempt_at = max(item.next_attempt_at, now + delay)
+            return True
+    if len(_pending_replies) >= PENDING_REPLY_MAX_ITEMS or delay >= PENDING_REPLY_TTL_SECONDS:
+        logger.error("❌ 【%s】待发队列已满或等待超过保留期限，通知未入队。", description)
+        return False
+    _pending_replies.append(PendingReply(
+        send_func, text, description, dict(kwargs), now + PENDING_REPLY_TTL_SECONDS,
+        now + max(PENDING_REPLY_INTERVAL_SECONDS, delay), is_edit=is_edit,
+    ))
+    logger.warning("📨 【%s】通知进入待发队列（共 %d 条），只补通知，不重新提交下载。",
+                   description, len(_pending_replies))
+    return True
+
+
+async def flush_pending_replies(context):
+    """每轮最多补少量通知，每条只尝试一次，避免网络离线时长时间拖住发送通道。"""
+    global _pending_flush_running, _pending_active_reply
+    if _pending_flush_running or not context.application.running:
+        return
+    _pending_flush_running = True
+    try:
+        now = time.monotonic()
+        for item in list(_pending_replies):
+            if item.expires_at <= now or item.attempts >= PENDING_REPLY_MAX_ATTEMPTS:
+                _pending_replies.remove(item)
+                logger.error("❌ 【%s】通知补发已到期限/次数上限，停止补发。", item.description)
+        due = [item for item in _pending_replies if item.next_attempt_at <= now][:PENDING_REPLY_BATCH_SIZE]
+        for item in due:
+            if not context.application.running:
+                break
+            # 前一条发送时其它 handler 可能已经清理过期项，快照不代表当前仍有效。
+            if not any(queued is item for queued in _pending_replies):
+                continue
+            # 前一条 await 期间可能收到更长的 RetryAfter，不能只依赖旧的到期快照。
+            if item.next_attempt_at > time.monotonic():
+                continue
+            if item.expires_at <= time.monotonic():
+                _pending_replies.remove(item)
+                logger.error("❌ 【%s】通知超过保留期限，停止补发。", item.description)
+                continue
+            # 发送期间保留队列中的占位，既计入容量，也让前台重入同通知能正确去重。
+            _pending_active_reply = item
+            item.attempts += 1
+            try:
+                await item.send_func(item.text, **item.kwargs)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                if item.is_edit and isinstance(error, BadRequest) and "message is not modified" in str(error).lower():
+                    _pending_replies.remove(item)
+                    logger.info("✅ 【%s】目标消息已是最终内容，补发完成。", item.description)
+                    continue
+                if isinstance(error, RetryAfter):
+                    delay = _retry_after_seconds(error)
+                elif _is_network_error(error) and (item.is_edit or _is_unsent_failure(error)):
+                    delay = min(300.0, PENDING_REPLY_INTERVAL_SECONDS * 2 ** min(item.attempts, 4))
+                else:
+                    _pending_replies.remove(item)
+                    logger.error("❌ 【%s】补发终止（永久错误或送达不确定，避免重复通知）: %s",
+                                 item.description, error, exc_info=True)
+                    continue
+                # 发送期间若前台重复入队带来更长的限流等待，不能被本次较短退避覆盖。
+                item.next_attempt_at = max(item.next_attempt_at,
+                                           time.monotonic() + max(PENDING_REPLY_INTERVAL_SECONDS, delay))
+                if item.next_attempt_at < item.expires_at and item.attempts < PENDING_REPLY_MAX_ATTEMPTS:
+                    _pending_replies.remove(item)
+                    _pending_replies.append(item)
+                    logger.warning("⚠️ 【%s】第 %d 次补发失败，将按退避间隔继续: %s",
+                                   item.description, item.attempts, error)
+                else:
+                    _pending_replies.remove(item)
+                    logger.error("❌ 【%s】通知补发已到期限/次数上限，停止补发。", item.description)
+            else:
+                _pending_replies.remove(item)
+                logger.info("✅ 【%s】通知补发成功。", item.description)
+            finally:
+                _pending_active_reply = None
+    finally:
+        _pending_active_reply = None
+        _pending_flush_running = False
+
+
+async def _safe_send(send_func, text: str, description: str, *, queue_on_failure=False,
+                     is_edit=False, failure_state=None, **kwargs):
     """发送/编辑 Telegram 消息，遇到瞬时网络故障自动重试，且失败必留日志。
 
     为什么要单独抽出来：
@@ -720,6 +923,15 @@ async def _safe_send(send_func, text: str, description: str, **kwargs):
         调用方必须根据返回值决定后续动作，不要用「发送失败」去否定已完成的业务动作。
     """
     last_error: Exception | None = None
+    if failure_state is not None:
+        failure_state.clear()
+
+    def defer(delay=0.0):
+        if queue_on_failure:
+            queued = _queue_pending_reply(send_func, text, description, kwargs,
+                                           delay=delay, is_edit=is_edit)
+            if failure_state is not None:
+                failure_state["queued"] = queued
 
     for attempt in range(1, REPLY_MAX_ATTEMPTS + 1):
         try:
@@ -729,9 +941,30 @@ async def _safe_send(send_func, text: str, description: str, **kwargs):
             return result if result is not None else True
         except Exception as e:
             last_error = e
+            uncertain = _is_network_error(e) and not _is_unsent_failure(e)
+            if failure_state is not None and uncertain:
+                failure_state["uncertain"] = True
+            if is_edit and isinstance(e, BadRequest) and "message is not modified" in str(e).lower():
+                return True
+            if isinstance(e, RetryAfter):
+                delay = _retry_after_seconds(e)
+                if failure_state is not None:
+                    failure_state["rate_limited"] = True
+                if attempt < REPLY_MAX_ATTEMPTS and delay <= REPLY_RATE_LIMIT_WAIT_SECONDS:
+                    await asyncio.sleep(delay)
+                    continue
+                defer(delay)
+                logger.warning("⚠️ 【%s】Telegram 限流，至少 %.1f 秒后才允许重试。", description, delay)
+                return None
             # 非网络异常(例如 Markdown 解析失败、消息过长)重试没有意义，立刻放弃
             if not _is_network_error(e):
                 logger.error("❌ 【%s】发送失败(非网络异常，不重试): %s", description, e, exc_info=True)
+                return None
+
+            if uncertain and not is_edit:
+                # Telegram 可能已接收但响应丢失：新消息重发会重复通知，必须如实记录边界。
+                logger.error("❓ 【%s】发送后未确认送达，不自动重发新消息，避免重复通知: %s",
+                             description, e, exc_info=True)
                 return None
 
             if attempt < REPLY_MAX_ATTEMPTS:
@@ -746,12 +979,13 @@ async def _safe_send(send_func, text: str, description: str, **kwargs):
                 await asyncio.sleep(REPLY_RETRY_DELAY_SECONDS)
 
     logger.error(
-        "❌ 【%s】重试 %d 次后仍发送失败，消息未送达用户: %s",
+        "❌ 【%s】重试 %d 次后仍未确认回执送达: %s",
         description,
         REPLY_MAX_ATTEMPTS,
         last_error,
         exc_info=last_error,
     )
+    defer()
     return None
 
 
@@ -848,18 +1082,23 @@ async def _reply_single_link(update: Update, link: str) -> None:
         outcome = SubmitOutcome(False, _describe_submit_failure(e, link), "CD2 提交失败回执")
 
     if not outcome.ok:
-        await _safe_send(update.message.reply_text, outcome.message, description=outcome.description)
+        await _safe_send(update.message.reply_text, outcome.message, description=outcome.description,
+                         queue_on_failure=True)
         return
 
     # 走到这里说明任务已经在 CD2 上跑起来了。
-    # 后续回执发不出去只能记日志，绝不能反过来告诉用户「提交失败」。
+    # 后续只重试通知、必要时入待发队列，绝不能重新提交或反过来说「提交失败」。
+    failure_state = {}
     delivered = await _safe_send(
         update.message.reply_text,
         f"✅ 提交成功！\n📂 目录：`{SAVE_PATH}`\n提示：完成后发送 /clean 执行清理。",
         description="提交成功回执",
+        queue_on_failure=True,
+        failure_state=failure_state,
     )
     if not delivered:
-        logger.error("❗ 任务已在 CD2 提交成功，但成功回执未能送达用户，链接: %s", _mask_link(link))
+        reply_status = "暂未确认送达用户" if failure_state.get("uncertain") else "未能送达用户"
+        logger.error("❗ 任务已在 CD2 提交成功，但成功回执%s，链接: %s", reply_status, _mask_link(link))
 
 
 async def _submit_batch_links(update: Update, links: list[str]) -> None:
@@ -893,10 +1132,16 @@ async def _submit_batch_links(update: Update, links: list[str]) -> None:
     report = _build_batch_report(results)
     # 优先把进度消息改成结果，避免聊天里留一条永远「正在提交…」的提示
     if status_msg is not None:
-        if await _safe_send(status_msg.edit_text, report, description="批量提交报告"):
+        failure_state = {}
+        if await _safe_send(status_msg.edit_text, report, description="批量提交报告",
+                            is_edit=True, queue_on_failure=True, failure_state=failure_state):
+            return
+        if failure_state.get("queued") or failure_state.get("uncertain") or failure_state.get("rate_limited"):
+            # 编辑超时可能已生效，继续编辑同一条消息是幂等的，不能立刻另发造成双报告。
             return
         logger.warning("⚠️ 批量报告编辑失败，改为新消息重发")
-    await _safe_send(update.message.reply_text, report, description="批量提交报告(新消息)")
+    await _safe_send(update.message.reply_text, report, description="批量提交报告(新消息)",
+                     queue_on_failure=True)
 
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -948,6 +1193,7 @@ async def cmd_clean(update: Update, context: ContextTypes.DEFAULT_TYPE):
             status_msg.edit_text,
             f"❌ 无法执行清理（{type(e).__name__}）：{_shorten(_grpc_error_raw(e))}",
             description="清理失败回执",
+            is_edit=True,
         )
         return
 
@@ -958,12 +1204,14 @@ async def cmd_clean(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status_msg.edit_text,
         f"📊 **清理报告：**\n{report}",
         description="清理报告(Markdown)",
+        is_edit=True,
         parse_mode='Markdown',
     ):
         await _safe_send(
             status_msg.edit_text,
             f"📊 清理报告：\n{report}",
             description="清理报告(纯文本降级)",
+            is_edit=True,
         )
 
 
@@ -997,6 +1245,14 @@ async def post_init(application):
     # 修复假死问题：不要单独创建 AsyncIOScheduler 实例，否则会引发 asyncio 事件循环冲突
     # 改为使用 python-telegram-bot 内置的 job_queue，由于自带的 job_queue 可以良好管理协程，避免卡死。
     if application.job_queue:
+        application.job_queue.run_repeating(
+            flush_pending_replies,
+            interval=PENDING_REPLY_INTERVAL_SECONDS,
+            first=PENDING_REPLY_INTERVAL_SECONDS,
+            name="pending_reply_delivery",
+        )
+        logger.info("📨 下载结果通知补发已启用：内存最多 %d 条，保留 %d 秒。",
+                    PENDING_REPLY_MAX_ITEMS, PENDING_REPLY_TTL_SECONDS)
         # job_queue 内部包含了一个配置好的 apscheduler 实例
         application.job_queue.scheduler.add_job(
             run_auto_clean, 
@@ -1035,10 +1291,10 @@ if __name__ == '__main__':
     if PROXY_URL:
         logger.info(f"正在配置网络代理: {PROXY_URL}")
         # telegram.request.HTTPXRequest 在 v22+ 支持直接传入 proxy 参数
-        q_request = HTTPXRequest(proxy=PROXY_URL, **request_kwargs)
+        q_request = ResilientHTTPXRequest(proxy=PROXY_URL, **request_kwargs)
         u_request = HTTPXRequest(proxy=PROXY_URL, **request_kwargs)
     else:
-        q_request = HTTPXRequest(**request_kwargs)
+        q_request = ResilientHTTPXRequest(**request_kwargs)
         u_request = HTTPXRequest(**request_kwargs)
         
     # 构造应用实例，并同时为 bot 实例和 updater(getUpdates轮询) 注入支持代理的网络请求类
