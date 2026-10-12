@@ -17,13 +17,54 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import httpx
 from telegram.error import NetworkError
 
 import main
 
 
+def _connect_failure():
+    """模拟 PTB 的真实异常链，明确请求在建立连接时失败、尚未送达。"""
+    error = NetworkError("httpx.ConnectError: ")
+    error.__cause__ = httpx.ConnectError("")
+    return error
+
+
 class FakeAioRpcError(Exception):
     """模拟 grpc.aio.AioRpcError，用于验证错误类型名会被带上。"""
+
+
+class FakeRpcErrorWithDetails(Exception):
+    """更接近真实的 AioRpcError：带 code() 与 details()，str() 是多行 repr。
+
+    2026-10-09 生产实测：115open 对重复链接返回的是
+        StatusCode.INTERNAL + "api error Cloud 115open(5975675) api error:
+        code: 10008, message: 任务已存在，请勿输入重复的链接地址"
+    它是**抛异常**回来的，不是 success=False，所以必须走异常路径的归类。
+    """
+
+    def __init__(self, code_name: str, details: str):
+        self._code = code_name
+        self._details = details
+        super().__init__(
+            "<AioRpcError of RPC that terminated with:\n"
+            f'status = {code_name}\n'
+            f'details = "{details}"\n'
+            f'debug_error_string = "INTERNAL:{details}"\n>'
+        )
+
+    def code(self):
+        return self._code
+
+    def details(self):
+        return self._details
+
+
+# 用户 2026-10-09 在 bot 上收到的真实报错（原文照抄）
+REAL_DUPLICATE_DETAILS = (
+    "api error Cloud 115open(5975675) api error: "
+    "code: 10008, message: 任务已存在，请勿输入重复的链接地址"
+)
 
 
 class _FakeChannel:
@@ -94,7 +135,7 @@ class SubmitErrorAttributionTests(unittest.TestCase):
         )
         # 第一次发送撞上代理/Telegram 瞬时故障，第二次恢复
         update, reply_text = _make_update(
-            reply_side_effect=[NetworkError("httpx.ConnectError: "), None]
+            reply_side_effect=[_connect_failure(), None]
         )
 
         self._run_with_stub(stub, update)
@@ -112,7 +153,7 @@ class SubmitErrorAttributionTests(unittest.TestCase):
             AddOfflineFiles=AsyncMock(return_value=SimpleNamespace(success=True, errorMessage=""))
         )
         update, reply_text = _make_update(
-            reply_side_effect=NetworkError("httpx.ConnectError: ")
+            reply_side_effect=_connect_failure()
         )
 
         with self.assertLogs("main", level="ERROR") as logs:
@@ -124,7 +165,35 @@ class SubmitErrorAttributionTests(unittest.TestCase):
             f"回执丢失必须留日志，实际: {logs.output}",
         )
 
-    def test_cd2_duplicate_rejection_is_friendly(self):
+    def test_duplicate_via_rpc_exception_is_friendly(self):
+        """真实场景：115open 把「重复提交」以 gRPC INTERNAL 异常抛出。
+
+        这条路径上一版漏掉了 —— 用户看到的仍是 AioRpcError 的整段 repr。
+        """
+        stub = SimpleNamespace(
+            AddOfflineFiles=AsyncMock(
+                side_effect=FakeRpcErrorWithDetails("StatusCode.INTERNAL", REAL_DUPLICATE_DETAILS)
+            )
+        )
+        update, reply_text = _make_update()
+
+        with self.assertLogs("main", level="ERROR") as logs:
+            self._run_with_stub(stub, update)
+
+        self.assertEqual(reply_text.await_count, 1)
+        message = reply_text.await_args.args[0]
+        self.assertEqual(message, main.DUPLICATE_REPLY)
+        # 三样都不能再出现：多行 repr、debug_error_string、误报的「连接异常」
+        self.assertNotIn("AioRpcError", message)
+        self.assertNotIn("debug_error_string", message)
+        self.assertNotIn("连接异常", message)
+        # 原始细节必须留在日志里
+        self.assertTrue(
+            any("任务已存在" in line for line in logs.output),
+            f"原始 details 应写进日志，实际: {logs.output}",
+        )
+
+    def test_duplicate_rejection_is_friendly(self):
         """CD2 判定重复提交：转成人话，不把技术性 errorMessage 甩给用户。"""
         stub = SimpleNamespace(
             AddOfflineFiles=AsyncMock(
@@ -161,6 +230,59 @@ class SubmitErrorAttributionTests(unittest.TestCase):
         self.assertEqual(reply_text.await_count, 1)
         self.assertIn("提交成功", reply_text.await_args.args[0])
 
+    # --- http(s) 直链：云盘拒绝 vs 真连不上，必须给出不同结论（v1.1.10-8）---
+
+    HTTP_LINK = "https://example.com/video.mp4"
+
+    def test_http_link_rejection_explains_drive_limitation(self):
+        """http 直链被云盘拒绝 → 结论（后端网盘不吃直链）+ 原始原因摘要。
+
+        CD2 的离线下载由后端网盘执行，115open 之类只吃磁力 / ed2k，
+        因此直链被拒时不能只丢一句「提交失败」让用户自己猜。
+        """
+        stub = SimpleNamespace(
+            AddOfflineFiles=AsyncMock(
+                return_value=SimpleNamespace(
+                    success=False, errorMessage="api error: code 400, url type not allowed"
+                )
+            )
+        )
+        update, reply_text = _make_update(text=self.HTTP_LINK)
+
+        with self.assertLogs("main", level="WARNING") as logs:
+            self._run_with_stub(stub, update)
+
+        message = reply_text.await_args.args[0]
+        self.assertIn("HTTP/HTTPS 直链", message)
+        self.assertIn("ed2k", message)  # 必须给出替代方案
+        # 与「重复提交」不同：直链的结论是**推测性**的（后端网盘不一定只因为格式拒绝），
+        # 所以要附一行摘要让用户能自行判断（如其实是链接失效 / 配额不足）。
+        # 注意这一行是 _shorten() 后的单行摘要，不是原样转发 —— 完整原文仍在日志里。
+        self.assertIn("原始原因：", message)
+        self.assertNotIn("\n\n", message)
+        self.assertTrue(
+            any("url type not allowed" in line for line in logs.output),
+            f"原始 errorMessage 必须完整写进日志，实际: {logs.output}",
+        )
+
+    def test_http_link_transport_failure_still_blames_connection(self):
+        """回归保护：真连不上 CD2 时，http 直链也不能被说成「网盘不支持直链」。"""
+        stub = SimpleNamespace(
+            AddOfflineFiles=AsyncMock(
+                side_effect=FakeAioRpcError(
+                    "StatusCode.UNAVAILABLE, failed to connect to all addresses"
+                )
+            )
+        )
+        update, reply_text = _make_update(text=self.HTTP_LINK)
+
+        with self.assertLogs("main", level="ERROR"):
+            self._run_with_stub(stub, update)
+
+        message = reply_text.await_args.args[0]
+        self.assertIn("CD2 连接异常", message)
+        self.assertNotIn("直链", message)
+
 
 class SafeSendTests(unittest.TestCase):
     def setUp(self):
@@ -179,17 +301,23 @@ class SafeSendTests(unittest.TestCase):
         self.assertEqual(send.await_count, 1)
 
     def test_network_error_is_retried_until_success(self):
-        send = AsyncMock(side_effect=[NetworkError("httpx.ConnectError: "), None, None])
+        send = AsyncMock(side_effect=[_connect_failure(), None, None])
         result = asyncio.run(main._safe_send(send, "hello", description="测试消息"))
         self.assertTrue(result)
         self.assertEqual(send.await_count, 2)
 
     def test_all_attempts_exhausted_returns_false(self):
-        send = AsyncMock(side_effect=NetworkError("httpx.ConnectError: "))
+        send = AsyncMock(side_effect=_connect_failure())
         with self.assertLogs("main", level="ERROR"):
             result = asyncio.run(main._safe_send(send, "hello", description="测试消息"))
         self.assertFalse(result)
         self.assertEqual(send.await_count, main.REPLY_MAX_ATTEMPTS)
+
+    def test_send_result_is_returned_to_caller(self):
+        """批量提交需要拿到消息对象才能把进度消息 edit 成最终报告，返回值必须透传。"""
+        message = object()
+        send = AsyncMock(return_value=message)
+        self.assertIs(asyncio.run(main._safe_send(send, "hello", description="测试消息")), message)
 
 
 class MaskLinkTests(unittest.TestCase):

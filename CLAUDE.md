@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-CloudDrive2 Telegram Bot (cd2_magnet_tgbot) - A Telegram bot that manages offline downloads for CloudDrive2. It accepts magnet/http/ed2k links, submits them to CD2 for offline download, and provides automated cleanup functionality.
+CloudDrive2 Telegram Bot (cd2_magnet_tgbot) - A Telegram bot that manages offline downloads for CloudDrive2. It accepts magnet/ed2k/http(s) links, submits them to CD2 for offline download, and provides automated cleanup functionality. Note: CD2 delegates offline downloads to the **backing cloud drive**, so magnet/ed2k are reliably supported while http(s) direct links usually are not (115open only takes magnet/ed2k).
 
 **Tech Stack**: Python 3.13 + python-telegram-bot (v22+) + gRPC + Docker
 
@@ -33,22 +33,25 @@ python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. clouddrive.pr
 > `requirements.txt` is **unpinned**, but the proxy and `JobQueue` patterns require **python-telegram-bot v22+**. If a fresh install resolves an older major version, the bot will break (proxy API and JobQueue behavior differ).
 
 ### Tests
-Unit tests live in `tests/` and need no network access:
+Regression tests live in `tests/`. They need no Telegram or CloudDrive2 service; transport recovery tests bind a temporary localhost proxy to reproduce TLS handshake failures:
 
 ```bash
-python -m unittest tests.test_polling_watchdog tests.test_network_error_handling
+python -m unittest discover -s tests -p 'test_*.py'
 ```
+> On Windows use the project's installed dependencies:
+> `.venv/Scripts/python.exe -m unittest discover -s tests -p 'test_*.py'`.
+> Run from the repository root, so `main.py` and the generated gRPC modules are importable.
 
 Integration behavior still requires `python main.py` against a live CloudDrive2 instance (or watching `docker-compose` logs).
 
 ## Architecture
 
 ### Single-File Design
-All business logic resides in `main.py` (~580 lines; version string in `__version__`). The code is organized into 4 commented sections (referenced by function name since line numbers drift):
+All business logic resides in `main.py` (version string in `__version__`). The code is organized into 4 commented sections (referenced by function name since line numbers drift):
 1. **Variable Configuration**: env vars → module constants (note the renames, see Environment Variables below)
 2. **Core Cleanup Logic**: `get_blacklist()`, `get_all_items_recursive()`, `is_directory_empty()`, `clean_task_folder()`, `run_auto_clean()`
-3. **Telegram Handlers**: `error_handler()`, `_get_polling_task()`, `watchdog_check()`, `_mask_link()`, `_friendly_reject_reason()`, `_safe_send()`, `handle_link()`, `cmd_clean()`, `cmd_blacklist()`, `post_init()`
-4. **Entry Point** (`__main__`): proxy/`HTTPXRequest` setup, `ApplicationBuilder` wiring, `run_polling()`
+3. **Telegram Handlers**: `error_handler()`, `_get_polling_task()`, `watchdog_check()`, `_mask_link()`, `_extract_links()`, `_shorten()`, `_grpc_error_raw()`, `_is_transport_failure()`, `_classify_reject_reason()`, `_friendly_reject_reason()`, `_describe_submit_failure()`, `_safe_send()`, `SubmitOutcome`, `_submit_offline_link()`, `_build_batch_report()`, `_reply_single_link()`, `_submit_batch_links()`, `handle_link()`, `cmd_clean()`, `cmd_blacklist()`, `post_init()`
+4. **Entry Point** (`__main__`): ordinary API requests use `ResilientHTTPXRequest`; getUpdates keeps a separate `HTTPXRequest`. `ApplicationBuilder` wires both clients and `run_polling()` manages their lifecycle.
 
 ### Key Components
 
@@ -79,31 +82,139 @@ failed connection is completely silent).
 Convention:
 - Submit first, reply second. Only the submit step may report `CD2 连接异常` (include
   `type(e).__name__`, and log with `logger.exception`).
-- Send replies through `_safe_send()`, which retries transient network errors, skips retrying
-  non-network errors (e.g. Markdown parse failures) and always logs the final failure.
+- Send replies through `_safe_send()`. New messages retry only confirmed unsent failures or
+  Telegram `RetryAfter`; unknown delivery outcomes are logged without duplicating a new message.
+  Edits use `is_edit=True` because editing the same message to the same content is idempotent.
 - If the reply cannot be delivered, log it — never tell the user the business action failed.
 - Long links go into logs via `_mask_link()` (magnet `dn=` payloads are huge).
 
-### User-Facing Rejection Messages (v1.1.9+)
-`FileOperationResult.errorMessage` is written for developers and often carries raw cloud-drive
-API text (English, error codes, even JSON). **Never forward it verbatim to the user.** Pass it
-through `_friendly_reject_reason()`, which classifies the message into a short human reply:
-- duplicate task (`已存在` / `already exist` / `duplicate` …) → `DUPLICATE_REPLY`, the most
-  common case, since re-sending a link is reported by CD2 as a rejection;
-- auth / permission → tell the user to check `CD2_TOKEN`;
-- unsupported link → say CD2 cannot handle that link;
-- anything else → strip CD2 action prefixes, truncate to `_REJECT_TEXT_LIMIT`, prefix with
-  `❌ 提交失败：`.
+### Outbound Pool Recovery and Final Receipts (v1.1.10-9+)
 
-The raw message must always stay in the log (`logger.warning`) — simplification applies to the
-Telegram reply only. Adding a new category means adding keywords to the hint tuples and a test
-in `tests/test_reject_message_format.py`.
+`ResilientHTTPXRequest` serializes ordinary requests, initialization and shutdown with one
+`asyncio.Lock`. A confirmed connect/proxy/pool failure triggers `HTTPXRequest.shutdown()` and
+`initialize()` through public APIs. Rebuilding preserves constructor configuration and never
+touches the separate getUpdates client. `RequestNotSent` marks recovery failures before any API
+request was issued. `CancelledError` propagates instead of restarting the client during shutdown.
+
+`_safe_send(send_func, text, description, *, queue_on_failure=False, is_edit=False,
+failure_state=None, **kwargs)` preserves its truthy success / `None` failure contract. Final
+download receipts opt into `queue_on_failure=True`; transient progress messages do not.
+`BadRequest` inherits `NetworkError`, so `_is_network_error()` must exclude permanent Telegram
+errors before using network-type or message heuristics. `RetryAfter.retry_after` can be an integer
+or `timedelta`; never retry before that delay or bypass it by sending a replacement report.
+`BadRequest("Message is not modified")` is successful completion for edits.
+
+`PendingReply`, `_queue_pending_reply()` and `flush_pending_replies()` retain only notification
+callbacks and final text, never a CD2 submission callback. `post_init()` registers the flush on
+the built-in `JobQueue`. The queue has at most 100 items, a 3600-second TTL and 120 resend
+attempts per item; whichever limit is reached first stops delivery. A 30-second job tries at most
+5 due entries, with network backoff up to 300 seconds. In-flight entries count toward capacity
+and deduplication; cancellation preserves their queue entry. Application shutdown blocks new
+flushes. This is an in-memory queue: restarting loses pending notifications and cannot recover
+old receipts discarded by previous versions.
+
+For a new message, read/write/protocol errors or unclassified network failures mean delivery is
+unknown. Do not retry or enqueue it, because Telegram may already have accepted it. An edit
+retains the original edit callback for safe retries. `_submit_batch_links()` uses `failure_state`
+to stop immediate new-message fallback when the edit is deferred or delivery is uncertain.
+Never call `AddOfflineFiles` again while recovering Telegram delivery.
+
+`tests/test_send_recovery.py` covers real localhost proxy/TLS behavior, send/getUpdates isolation,
+request lifecycle locking, confirmed-unsent notification delivery, unknown outcomes, limit and
+TTL handling, cancellation, permanent errors, rate limits and batch-report behavior. These tests
+are isolated verification, not proof of a live production deployment.
+
+### User-Facing Rejection Messages (v1.1.9+, extended in v1.1.10)
+Technical CD2 errors reach the user through **two independent paths** — both must be
+classified, and handling only one is a real bug that shipped in v1.1.9:
+- **(a) gRPC raises an exception.** Cloud-drive rejections are wrapped into gRPC status
+  codes. Measured 2026-10-09: 115open answers a duplicate link with
+  `StatusCode.INTERNAL` + `code: 10008` + `任务已存在，请勿输入重复的链接地址` — *not*
+  `success=False`. Handle via `_describe_submit_failure()`.
+- **(b) `FileOperationResult(success=False, errorMessage=...)`.** Developer-facing text that
+  often carries raw cloud-drive API content (English, error codes, JSON). Handle via
+  `_friendly_reject_reason()`.
+
+Both share `_classify_reject_reason(raw, link)`, which returns `DUPLICATE_REPLY` for duplicate
+hints (`已存在` / `已在` / `重复` / `already exist` / `duplicate` …), a `CD2_TOKEN` hint for auth
+failures, a "not supported" reply (swapped for the http(s)-direct-link reply when `link` is an
+http(s) URL), or `None` when unclassified.
+
+Rules:
+- **`INTERNAL` is not a connection problem.** Only `UNAVAILABLE` / `DEADLINE_EXCEEDED`
+  (`_TRANSPORT_STATUS_CODES`, with `_TRANSPORT_TEXT_HINTS` as fallback for non-gRPC
+  exceptions) justify telling the user `CD2 连接异常`. Everything else says `提交失败`.
+- **Never expose `AioRpcError`.** Its `str()` is a 4-line repr whose `debug_error_string`
+  duplicates `details`. Always go through `_grpc_error_raw()` (prefers `details()`) and
+  `_shorten()` (single-line + truncate to `_REJECT_TEXT_LIMIT`).
+- The raw error must always stay in the log (`logger.exception` / `logger.warning`) —
+  simplification applies to the Telegram reply only.
+- Adding a category means adding keywords to the hint tuples and a test in
+  `tests/test_reject_message_format.py` (plus an end-to-end case in
+  `tests/test_submit_error_attribution.py` when the new path is submit-related).
+- **http(s) direct links get their own explanation.** CD2's offline download is executed by the
+  **backing cloud drive** (115open / Xunlei / PikPak); 115open-type drives only take magnet/ed2k,
+  so a direct link is almost always rejected. When `link` is http(s) and submission fails,
+  return `_http_direct_link_reply()`: the conclusion first, plus an `原始原因：<digest>` line
+  when the reason is unclassified.
+- **Attribution order is load-bearing**: duplicate / auth > **real transport failure
+  (`UNAVAILABLE` / `DEADLINE_EXCEEDED`)** > http(s)-direct-link hint > generic fallback.
+  The transport check must come *before* the http(s) hint, otherwise a genuinely unreachable
+  CD2 gets mislabelled as "your drive does not support direct links" and the network problem
+  everyone should be looking at gets buried
+  (`HttpDirectLinkFailureTests.test_transport_failure_beats_http_hint` guards this).
+- `_is_http_link()` uses a strict `startswith(("http://", "https://"))` — never `in` or a loose
+  match, or `httpsx://…` would be misjudged.
+
+### Batch Links (v1.1.10-5+)
+A single message may carry **several links of mixed schemes** (magnet / ed2k / http(s)).
+
+- `_extract_links(text)` regex-scans the whole message body instead of checking
+  `text.startswith(...)`. The old prefix check silently dropped numbered lists
+  (`1. magnet:... 2. ed2k://...`) — a real bug: nothing was submitted at all.
+  It also deduplicates, lowercases the scheme only (never the rest of the URL, or magnet
+  `dn=` payloads would change), and strips trailing punctuation.
+- The regex stops at **CJK punctuation but not at CJK ideographs** — ed2k filenames are
+  commonly unencoded Chinese (`ed2k://|file|某部电影.avi|...`), so breaking on Han characters
+  would truncate the link. ASCII `)`/`]`/`}` are intentionally kept so URLs such as
+  `https://zh.wikipedia.org/wiki/Foo_(bar)` survive intact.
+- **Newline-separated lists need no special handling** — `\s` already covers LF, CRLF, tabs and
+  the ideographic space, so "one link per line" (the main way people paste) just works.
+- Tail cleaning is two layers, in this order: `_LINK_TRAILING_CHARS` (punctuation) then
+  `_WRAPPER_PAIRS` (paired wrappers `` ` `` `[ ]` `( )` `{ }`), looped until stable because they
+  stack (`[link]。`). A wrapper is only stripped when its opener is **absent** from the link body —
+  that single rule is what keeps `Foo_(bar)` and `[::1]` intact while cleaning `[magnet:...]`.
+  See `LinkPasteFormatTests` before touching it.
+- Zero-width characters (`_INVISIBLE_CHARS`) are deleted as noise, never treated as separators —
+  treating them as separators would split a link in half.
+- **Forwarded messages arrive in three shapes and all three must work** (`_collect_message_links()`):
+  1. plain `text` — forwarding never rewrites the body;
+  2. a **media post's `caption`** — the link lives there and `text` is `None`. This is the most
+     common shape when forwarding a torrent/resource post, and the old `text`-only read silently
+     ignored it (no error, just no response — the hardest kind to notice);
+  3. **`text_link` entities** — the body is just "点此下载" and the URL sits in `entity.url`;
+     check **both** `entities` and `caption_entities`.
+- The handler filter must stay `(filters.TEXT | filters.CAPTION) & ~filters.COMMAND`
+  (`LINK_MESSAGE_FILTER`). A `filters.TEXT`-only filter drops caption messages **before** the
+  handler runs, so the bug is invisible from inside `handle_link` — only a filter-level test
+  (`MessageFilterTests`) catches it.
+- `text_link` URLs are accepted only for `magnet:`/`ed2k://`. http(s) hyperlinks in forwarded
+  posts are usually channels/groups/ads and would just spam failure replies.
+- **Each link is submitted in its own `AddOfflineFiles` call** (one shared channel/stub for
+  the whole batch), so success/failure is attributable per link and one rejection cannot
+  abort the rest. Do not "optimize" this back into one joined `urls` string.
+- Results go through `_build_batch_report()` as **plain text, no `parse_mode`** — link text
+  contains `_`, `*`, `[` which break legacy Markdown, and a parse failure would cost the
+  whole report. The report is also truncated below `_BATCH_REPORT_LIMIT` (3500) because
+  Telegram caps messages at 4096 and an over-long send fails with a non-retryable BadRequest.
+- `_safe_send()` returns the send result (normalized to a truthy value) instead of a bare
+  `True`, so the batch path can `edit_text()` the progress message into the final report.
 
 ### Telegram Bot v22+ Proxy Configuration
 Both `request` and `get_updates_request` must be configured with proxy:
 ```python
 from telegram.request import HTTPXRequest
-q_request = HTTPXRequest(proxy=PROXY_URL, connection_pool_size=8, ...)
+q_request = ResilientHTTPXRequest(proxy=PROXY_URL, connection_pool_size=8, ...)
 u_request = HTTPXRequest(proxy=PROXY_URL, ...)  # Required for getUpdates
 
 builder = ApplicationBuilder().token(TG_BOT_TOKEN).request(q_request).get_updates_request(u_request)
@@ -172,14 +283,50 @@ all_dirs.sort(key=lambda x: x.fullPathName.count('/'), reverse=True)
 
 4. **Permission Control**: All handlers must check `update.effective_user.id in ADMIN_IDS` at the beginning.
 
-5. **Error Handling**: The `error_handler` tracks network retry count and stops the application when `MAX_RETRIES` is exceeded. Non-network errors reset the counter.
+5. **Error Handling**: Network errors are only counted and logged (windowed by `NETWORK_ERROR_RESET_SECONDS`); they never stop the application anymore (v1.1.5+). Liveness is guarded by the polling watchdog instead. Non-network errors are logged on their own.
 
 6. **Cleanup Logic**: Files are deleted per-file, not per-folder. SIZE_THRESHOLD applies to each file individually. Blacklist only applies to files >= SIZE_THRESHOLD.
 
+## Branch & Versioning Convention (dev → master)
+
+Development happens on the **`dev`** branch; production releases happen on **`master`**. The two
+environments are isolated purely by **image tags**, so a busy dev branch never forces a production
+version bump.
+
+| Branch | `__version__` in `main.py` | Image tags built automatically | GitHub Release |
+| --- | --- | --- | --- |
+| `dev` | `1.1.10-1`, `1.1.10-2`, … (prod version + 1, with `-n` suffix) | `dev-latest`, `dev-1.1.10-1` | never |
+| `master` + `v*` tag | `1.1.10` (drop the `-n`) | `1.1.10`, `latest` | yes |
+
+Hard rules:
+- **`latest` is written only by a `v*` tag build. dev pushes must never touch it** — the tag
+  rules in `docker-publish.yml` gate each entry with `enable=` for exactly this reason.
+- The CI reads `__version__` straight out of `main.py` (`sed` on the
+  `__version__ = "x.y.z"` line) and feeds it into the dev image tag. **That line must keep its
+  exact format** — the workflow fails fast with `::error::` if it cannot be parsed.
+- `workflow_dispatch` builds `manual-<version>` so a manual run is reproducible and still cannot
+  overwrite `latest`.
+- Concurrency cancels superseded builds per ref, except for `v*` tag builds, which are never
+  cancelled.
+
+Promoting to production:
+1. `git switch master && git pull && git merge --no-ff dev`
+2. Rewrite `main.py` `__version__` to the plain release version (`1.1.10-2` → `1.1.10`) and sync
+   `README.md` (version line + changelog).
+3. `git commit && git push origin master`, then `git tag v1.1.10 && git push origin v1.1.10`.
+4. Back on `dev`, bump the base to the next pre-release line (`1.1.11-1`) so the two branches
+   cannot collide.
+
 ## Release Process
 
-1. Update version in `main.py` (`__version__`) and `README.md` — these are **informational only** and kept in sync by hand.
+1. Update version in `main.py` (`__version__`) and `README.md` — these are kept in sync by hand.
+   On `dev` the value carries a `-n` suffix; the release itself uses the plain version.
 2. Create and push a version tag: `git tag v1.x.x && git push origin v1.x.x`
-3. `.github/workflows/docker-publish.yml` triggers on `v*` tags (or manual `workflow_dispatch`) and pushes to `ghcr.io/<owner>/cd2_magnet_tgbot` (i.e. `ghcr.io/ymting/...`), tagging both the **semver from the git tag** and `latest`.
+3. `.github/workflows/docker-publish.yml` triggers on `v*` tags, on pushes to `dev`, and on manual
+   `workflow_dispatch`, pushing to `ghcr.io/<owner>/cd2_magnet_tgbot` (i.e. `ghcr.io/ymting/...`).
+   Tag pushes produce the **semver from the git tag** plus `latest`; dev pushes produce
+   `dev-latest` plus `dev-<__version__>`.
 
-The published image version comes from the **git tag**, not from `__version__` — the git tag is the source of truth.
+The published **production** image version comes from the **git tag**, not from `__version__` —
+the git tag is the source of truth there. The dev image version comes from `__version__`, which is
+why the two must stay consistent.
