@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 项目名称: CloudDrive2 Telegram 离线下载管家
-版本: 1.1.11-1 (dev 预发布；生产发版时改为 1.1.11)
+版本: 1.1.11-2 (dev 预发布；生产发版时改为 1.1.11)
 功能描述:
     1. 链接监听: 自动识别 Magnet、ed2k、http(s) 直链并提交至 CD2 离线下载。
        支持一条消息里混合粘贴多个不同类型的链接，逐个提交后汇总回执。
@@ -24,21 +24,23 @@ import time
 import grpc
 import asyncio
 import httpx
+import threading
 import clouddrive_pb2
 import clouddrive_pb2_grpc
 from datetime import datetime
 from typing import NamedTuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from functools import wraps
 from collections.abc import Callable
 
 # 版本号
 # 版本号。唯一来源：CI 直接从这里读取并生成镜像标签（见 docker-publish.yml）。
 # 约定：master 上是生产版本（如 1.1.10），dev 分支上带 -n 后缀（如 1.1.10-1、1.1.10-2）。
-__version__ = "1.1.11-1"
+__version__ = "1.1.11-2"
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from telegram import Update, BotCommand
-from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, filters
+from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, ExtBot, filters
 from telegram.request import HTTPXRequest
 from telegram.error import BadRequest, Forbidden, InvalidToken, NetworkError, TimedOut, RetryAfter
 
@@ -61,10 +63,74 @@ if NETWORK_ERROR_RESET_SECONDS <= 0:
 WATCHDOG_INTERVAL_SECONDS = int(os.getenv("WATCHDOG_INTERVAL_SECONDS", "60"))
 if WATCHDOG_INTERVAL_SECONDS < 0:
     raise ValueError("WATCHDOG_INTERVAL_SECONDS 不能为负数")
+POLLING_STALL_SECONDS = int(os.getenv("POLLING_STALL_SECONDS", "300"))
+if POLLING_STALL_SECONDS <= 0:
+    raise ValueError("POLLING_STALL_SECONDS 必须是大于 0 的整数")
+
+POLLING_RECOVERY_THRESHOLD = 3
+POLLING_RECOVERY_COOLDOWN_SECONDS = 60
+POLLING_MAX_RECOVERIES = 3
+POLLING_RECOVERY_TIMEOUT_SECONDS = 30
+POLLING_EXIT_TIMEOUT_SECONDS = 15
+POLLING_LOG_INTERVAL_SECONDS = 60
+POLLING_OBSERVATION_INTERVAL_SECONDS = 300
 
 # 配置日志输出，方便在 Docker 日志中查看运行状态
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+# 空队列检查与看门狗每半分钟/一分钟执行，不再用调度器的成功日志冒充业务健康。
+logging.getLogger("apscheduler").setLevel(logging.WARNING)
+
+
+def _polling_now() -> float:
+    return time.monotonic()
+
+
+@dataclass
+class PollingHealth:
+    """仅以 Bot API 成功拉取为接收健康依据，不把 HTTP 200 或重建连接当作成功。"""
+
+    started_at: float = field(default_factory=lambda: _polling_now())
+    last_success_at: float | None = None
+    retry_until: float = 0.0
+    consecutive_failures: int = 0
+    received_updates: int = 0
+    polling_started: bool = False
+    last_failure_log_at: float | None = None
+    last_observation_at: float | None = None
+    fatal_reason: str | None = None
+    exit_timer: object | None = None
+    active_handler_since: float | None = None
+    active_handler: str = "idle"
+    completed_handlers: int = 0
+    denied_updates: int = 0
+    last_denied_log_at: float | None = None
+
+    def mark_success(self, update_count: int, now: float | None = None) -> None:
+        current = _polling_now() if now is None else now
+        if self.consecutive_failures:
+            logger.info("✅ Telegram 接收已恢复：此前连续失败 %d 次。", self.consecutive_failures)
+        self.last_success_at = current
+        self.retry_until = 0.0
+        self.consecutive_failures = 0
+        self.received_updates += update_count
+        self.last_failure_log_at = None
+
+    def record_failure(self, error: Exception, now: float | None = None) -> None:
+        current = _polling_now() if now is None else now
+        self.consecutive_failures += 1
+        if isinstance(error, RetryAfter):
+            # 限流等待不是成功；只延后故障判定，避免在服务端要求静默时反复重启。
+            self.retry_until = max(self.retry_until, current + _retry_after_seconds(error) + 5)
+        if (self.last_failure_log_at is None
+                or current - self.last_failure_log_at >= POLLING_LOG_INTERVAL_SECONDS):
+            self.last_failure_log_at = current
+            logger.warning(
+                "🌐 Telegram 接收失败：类型=%s，连续失败=%d，距上次成功=%.0f秒，限流宽限剩余=%.0f秒。",
+                type(error).__name__, self.consecutive_failures,
+                current - (self.last_success_at if self.last_success_at is not None else self.started_at),
+                max(0.0, self.retry_until - current),
+            )
 
 
 class RequestNotSent(NetworkError):
@@ -141,6 +207,117 @@ class ResilientHTTPXRequest(HTTPXRequest):
                         # 恢复失败也保留原始网络异常，下次请求会先再次恢复。
                         logger.exception("❌ Telegram 普通发送连接池重建失败，将在下次请求重试。")
                 raise
+
+
+class PollingHTTPXRequest(HTTPXRequest):
+    """接收专用连接池：只修复传输，不重放请求，不接触 Updater 的 offset。"""
+
+    def __init__(self, *args, polling_health: PollingHealth, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.polling_health = polling_health
+        self._recovery_lock = asyncio.Lock()
+        self._shutdown = False
+        self._needs_recovery = False
+        self._transport_failures = 0
+        self._recovery_count = 0
+        self._last_recovery_at: float | None = None
+
+    async def initialize(self):
+        async with self._recovery_lock:
+            await super().initialize()
+            self._shutdown = False
+
+    async def shutdown(self):
+        async with self._recovery_lock:
+            self._shutdown = True
+            await super().shutdown()
+
+    def note_success(self) -> None:
+        # 由 MonitoredExtBot 在完整 API 解析成功后调用；HTTP 200 不能重置恢复预算。
+        self._transport_failures = 0
+        self._recovery_count = 0
+        self._needs_recovery = False
+
+    async def _recover_locked(self) -> None:
+        current = _polling_now()
+        if (self._shutdown or self._recovery_count >= POLLING_MAX_RECOVERIES
+                or (self._last_recovery_at is not None
+                    and current - self._last_recovery_at < POLLING_RECOVERY_COOLDOWN_SECONDS)):
+            return
+        self._last_recovery_at = current
+        self._recovery_count += 1
+        self._needs_recovery = True
+
+        async def rebuild():
+            # 与请求持有同一把锁，关闭旧池时不会取消仍在使用它的另一个请求。
+            # HTTPXRequest 公共生命周期保留最初的代理、超时和客户端构造参数。
+            await super(PollingHTTPXRequest, self).shutdown()
+            await super(PollingHTTPXRequest, self).initialize()
+
+        await asyncio.wait_for(rebuild(), timeout=POLLING_RECOVERY_TIMEOUT_SECONDS)
+        self._needs_recovery = False
+        logger.warning("🔄 Telegram 接收连接池已重建（本轮 %d/%d）；等待 API 成功确认恢复。",
+                       self._recovery_count, POLLING_MAX_RECOVERIES)
+
+    async def do_request(self, *args, **kwargs):
+        async with self._recovery_lock:
+            if self._shutdown:
+                raise RuntimeError("Telegram 接收客户端已关闭")
+            if self._needs_recovery:
+                try:
+                    await self._recover_locked()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    # 恢复失败不继续使用已经关闭的旧池；交回 PTB 按原 offset 重试。
+                    raise RequestNotSent("Telegram 接收连接池恢复失败，请求未发送") from error
+                if self._needs_recovery:
+                    raise RequestNotSent("Telegram 接收连接池恢复等待冷却或已用尽恢复预算")
+            try:
+                return await super().do_request(*args, **kwargs)
+            except asyncio.CancelledError:
+                self._needs_recovery = True
+                raise
+            except Exception as error:
+                if _is_network_error(error):
+                    self._transport_failures += 1
+                    if self._transport_failures >= POLLING_RECOVERY_THRESHOLD:
+                        try:
+                            await self._recover_locked()
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as recovery_error:
+                            logger.warning("❌ Telegram 接收连接池重建失败（%s）；保留原请求错误，等待下次恢复。",
+                                           type(recovery_error).__name__)
+                raise
+
+
+class MonitoredExtBot(ExtBot):
+    """围住真实 get_updates API 调用，补足 PTB 对 TimedOut 不触发 error_handler 的缺口。"""
+
+    __slots__ = ("polling_health", "polling_request")
+
+    def __init__(self, *args, polling_health: PollingHealth, **kwargs):
+        polling_request = kwargs.get("get_updates_request")
+        super().__init__(*args, **kwargs)
+        object.__setattr__(self, "polling_health", polling_health)
+        object.__setattr__(self, "polling_request", polling_request)
+
+    async def get_updates(self, *args, **kwargs):
+        if not self.polling_health.polling_started:
+            self.polling_health.started_at = _polling_now()
+            self.polling_health.polling_started = True
+        try:
+            updates = await super().get_updates(*args, **kwargs)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            self.polling_health.record_failure(error)
+            raise
+        self.polling_health.mark_success(len(updates))
+        if isinstance(self.polling_request, PollingHTTPXRequest):
+            self.polling_request.note_success()
+        return updates
 
 
 class TokenRedactionFilter(logging.Filter):
@@ -375,55 +552,73 @@ def _get_polling_task(updater: object) -> object | None:
 
     python-telegram-bot 把轮询任务存放在私有属性 `__polling_task`，
     按 Python 名称改写规则，外部访问到的名字是 `_Updater__polling_task`。
-    这里用 getattr 防御式取值：一旦未来版本调整内部结构，看门狗自身
-    不会因为 AttributeError 而崩溃，只会安静地不工作。
+    这里用 getattr 防御式取值；未来框架改名时安静跳过旧检测，API 进展检测仍继续工作。
     """
     return getattr(updater, "_Updater__polling_task", None)
 
 
-async def watchdog_check(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """轮询看门狗：发现 Telegram 轮询协程已死亡时，主动退出以便容器重启自愈。
+def _application_polling_health(application) -> PollingHealth | None:
+    candidate = application.bot_data.get("polling_health")
+    return candidate if isinstance(candidate, PollingHealth) else None
 
-    为什么需要它（v1.1.5 未能覆盖的真实故障）：
-        PTB 的 network_retry_loop 会把 HTTP 401/404 映射为 InvalidToken，
-        而 `except InvalidToken` 分支排在 `except TelegramError` 之前，
-        且只记日志后直接 `raise`，不会调用 on_err_cb。
-        结果是：轮询协程带着异常结束，但进程仍然存活，
-        全局 error_handler 也完全捕获不到任何异常。
-        对外表现就是「容器 running、重启次数 0、却再也收不到任何消息」的永久静默。
 
-    本任务周期检查轮询任务的状态：一旦发现它已结束（而应用理应还在运行），
-    就记录 CRITICAL 并调用 stop_running() 让进程退出，
-    交由 Docker 的 restart: always 完成重启，把「永久静默」降级为「最多静默一个检查周期」。
-    """
-    application = context.application
+def _force_process_exit() -> None:
+    logger.critical("🛑 故障关闭超过 %d 秒，强制以状态码 1 退出。", POLLING_EXIT_TIMEOUT_SECONDS)
+    os._exit(1)
 
-    # 应用正在正常关闭时，PTB 自己会取消轮询任务，这种情况不是故障，必须放行
-    if not application.running:
-        return
 
-    updater = application.updater
-    if updater is None:
-        return
-
-    polling_task = _get_polling_task(updater)
-    # 还没启动轮询，说明应用仍在 bootstrap 阶段，交由 PTB 自身的重试逻辑处理
-    if polling_task is None or not polling_task.done():
-        return
-
-    if polling_task.cancelled():
-        reason = "轮询任务被取消"
-    else:
-        error = polling_task.exception()
-        reason = f"{type(error).__name__}: {error}" if error else "轮询任务已结束（无异常）"
-
-    logger.critical(
-        "🛑 检测到 Telegram 轮询已停止：%s。"
-        "这通常意味着 401/404 触发了 InvalidToken 并绕过了错误处理器。"
-        "现在主动退出进程，交由 Docker restart 策略重启自愈。",
-        reason,
-    )
+def _request_fatal_restart(application, health: PollingHealth | None, reason: str) -> None:
+    if health is not None:
+        if health.fatal_reason is not None:
+            return
+        health.fatal_reason = reason
+        # PTB 关闭会等待轮询、消息队列等任务；独立线程兜底，避免退出也被挂住。
+        timer = threading.Timer(POLLING_EXIT_TIMEOUT_SECONDS, _force_process_exit)
+        timer.daemon = True
+        health.exit_timer = timer
+        timer.start()
+    logger.critical("🛑 %s。现在退出进程，交由 Docker restart 策略重启自愈。", reason)
     application.stop_running()
+
+
+async def watchdog_check(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """同时检测死轮询和活着却长期没有 API 成功的轮询；空结果同样代表健康。"""
+    application = context.application
+    updater = application.updater
+    # Updater.stop() 会先把 running 置为 False；正常关闭期间不启动故障退出计时器。
+    if not application.running or updater is None or getattr(updater, "running", True) is False:
+        return
+    health = _application_polling_health(application)
+    polling_task = _get_polling_task(updater)
+    if polling_task is not None and polling_task.done():
+        if polling_task.cancelled():
+            reason = "轮询任务被取消"
+        else:
+            error = polling_task.exception()
+            reason = f"{type(error).__name__}: {error}" if error else "轮询任务已结束（无异常）"
+        _request_fatal_restart(application, health, f"检测到 Telegram 轮询已停止：{reason}")
+        return
+    if health is None or health.fatal_reason is not None:
+        return
+    now = _polling_now()
+    reference = health.last_success_at if health.last_success_at is not None else health.started_at
+    # 限流到期后仍留完整请求恢复窗口，避免等待刚结束就因旧成功时间误触发重启。
+    effective_reference = max(reference, health.retry_until)
+    if now - effective_reference >= POLLING_STALL_SECONDS:
+        _request_fatal_restart(
+            application, health,
+            f"Telegram 接收连续 {now - reference:.0f} 秒未成功拉取（阈值 {POLLING_STALL_SECONDS} 秒）",
+        )
+        return
+    if (health.last_observation_at is None
+            or now - health.last_observation_at >= POLLING_OBSERVATION_INTERVAL_SECONDS):
+        health.last_observation_at = now
+        active_age = 0.0 if health.active_handler_since is None else now - health.active_handler_since
+        logger.info(
+            "📡 接收状态：距API成功=%.0f秒，收到更新=%d，队列积压=%d，处理阶段=%s，阶段耗时=%.0f秒，完成=%d，权限拒绝=%d。",
+            now - reference, health.received_updates, application.update_queue.qsize(),
+            health.active_handler, active_age, health.completed_handlers, health.denied_updates,
+        )
 
 
 # 回执发送的最大尝试次数与退避间隔(秒)。
@@ -1144,6 +1339,45 @@ async def _submit_batch_links(update: Update, links: list[str]) -> None:
                      queue_on_failure=True)
 
 
+def _observe_message(handler_name: str):
+    """仅记录准入与阶段，不记录正文、链接或用户标识；拒绝日志按全局时间窗口限频。"""
+    def decorate(callback):
+        @wraps(callback)
+        async def observed(update, context):
+            application = getattr(context, "application", None)
+            health = _application_polling_health(application) if application is not None else None
+            user = getattr(update, "effective_user", None)
+            now = _polling_now()
+            if user is None or user.id not in ADMIN_IDS:
+                if health is not None:
+                    health.denied_updates += 1
+                    if (health.last_denied_log_at is None
+                            or now - health.last_denied_log_at >= POLLING_LOG_INTERVAL_SECONDS):
+                        health.last_denied_log_at = now
+                        logger.warning("🔒 消息因 ADMIN_IDS 权限校验被忽略；累计拒绝=%d。", health.denied_updates)
+                return
+            update_id = getattr(update, "update_id", None)
+            if health is not None:
+                health.active_handler_since = now
+                health.active_handler = handler_name
+            logger.info("📥 开始处理：update_id=%s，类型=%s。", update_id, handler_name)
+            completed = False
+            try:
+                result = await callback(update, context)
+                completed = True
+                return result
+            finally:
+                logger.info("📤 处理结束：update_id=%s，类型=%s，正常返回=%s，耗时=%.1f秒。",
+                            update_id, handler_name, completed, _polling_now() - now)
+                if health is not None:
+                    health.active_handler_since = None
+                    health.active_handler = "idle"
+                    health.completed_handlers += int(completed)
+        return observed
+    return decorate
+
+
+@_observe_message("links")
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """监听并处理消息中的下载链接。
 
@@ -1153,11 +1387,11 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     能覆盖的转发形态见 `_collect_message_links` —— 明文、媒体帖说明文字（caption）、
     以及超链接形式的磁力/ed2k。
     """
-    if update.effective_user.id not in ADMIN_IDS: return
-
     links = _collect_message_links(update.message)
     if not links:
+        logger.info("ℹ️ 下载消息解析完成：未发现支持的下载链接。")
         return
+    logger.info("🔗 下载消息解析完成：链接数=%d；开始逐条提交并发送结果。", len(links))
 
     if len(links) == 1:
         await _reply_single_link(update, links[0])
@@ -1166,9 +1400,9 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _submit_batch_links(update, links)
 
 
+@_observe_message("clean")
 async def cmd_clean(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """手动清理命令 (/clean)"""
-    if update.effective_user.id not in ADMIN_IDS: return
     status_msg = await update.message.reply_text("🔍 正在全量扫描目录，请稍后...")
     results: list[str] = []
     try:
@@ -1215,9 +1449,9 @@ async def cmd_clean(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+@_observe_message("blacklist")
 async def cmd_blacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """管理黑名单关键词 (/blacklist)"""
-    if update.effective_user.id not in ADMIN_IDS: return
     current = get_blacklist()
     if context.args:
         new_word = " ".join(context.args)
@@ -1260,8 +1494,7 @@ async def post_init(application):
         )
         logger.info(f"📅 定时任务系统已启动(基于内置JobQueue)，Cron 设定: [{CLEAN_CRON}]")
 
-        # 轮询看门狗：周期性检查 Telegram 轮询协程是否还活着，
-        # 防止 401/404 → InvalidToken 导致的「进程活着但收不到消息」永久静默。
+        # 既检查协程死亡，也检查协程仍活着却持续超时而没有 API 成功进展的情形。
         if WATCHDOG_INTERVAL_SECONDS > 0:
             application.job_queue.run_repeating(
                 watchdog_check,
@@ -1269,7 +1502,8 @@ async def post_init(application):
                 first=WATCHDOG_INTERVAL_SECONDS,
                 name="polling_watchdog",
             )
-            logger.info(f"🐶 轮询看门狗已启动，检查周期 {WATCHDOG_INTERVAL_SECONDS} 秒。")
+            logger.info("🐶 轮询看门狗已启动：检查周期=%d秒，无成功拉取阈值=%d秒。",
+                        WATCHDOG_INTERVAL_SECONDS, POLLING_STALL_SECONDS)
         else:
             logger.warning("⚠️ 轮询看门狗已被禁用 (WATCHDOG_INTERVAL_SECONDS=0)。")
     else:
@@ -1278,7 +1512,7 @@ async def post_init(application):
 
 # ==========================================
 # 4. 程序入口
-if __name__ == '__main__':
+def build_application():
     # 代理网络配置
     request_kwargs = {
         "connection_pool_size": 8,
@@ -1289,18 +1523,16 @@ if __name__ == '__main__':
     }
     
     if PROXY_URL:
-        logger.info(f"正在配置网络代理: {PROXY_URL}")
-        # telegram.request.HTTPXRequest 在 v22+ 支持直接传入 proxy 参数
-        q_request = ResilientHTTPXRequest(proxy=PROXY_URL, **request_kwargs)
-        u_request = HTTPXRequest(proxy=PROXY_URL, **request_kwargs)
-    else:
-        q_request = ResilientHTTPXRequest(**request_kwargs)
-        u_request = HTTPXRequest(**request_kwargs)
-        
-    # 构造应用实例，并同时为 bot 实例和 updater(getUpdates轮询) 注入支持代理的网络请求类
-    builder = ApplicationBuilder().token(TG_BOT_TOKEN).post_init(post_init).request(q_request).get_updates_request(u_request)
-
+        logger.info("🌐 已启用 Telegram 网络代理（地址及认证信息不写入日志）。")
+        request_kwargs["proxy"] = PROXY_URL
+    health = PollingHealth()
+    q_request = ResilientHTTPXRequest(**request_kwargs)
+    u_request = PollingHTTPXRequest(polling_health=health, **request_kwargs)
+    bot = MonitoredExtBot(token=TG_BOT_TOKEN, polling_health=health,
+                          request=q_request, get_updates_request=u_request)
+    builder = ApplicationBuilder().bot(bot).post_init(post_init)
     app = builder.build()
+    app.bot_data["polling_health"] = health
 
     # 注册异常拦截器
     app.add_error_handler(error_handler)
@@ -1310,11 +1542,22 @@ if __name__ == '__main__':
     app.add_handler(MessageHandler(LINK_MESSAGE_FILTER, handle_link))
     app.add_handler(CommandHandler("clean", cmd_clean))
     app.add_handler(CommandHandler("blacklist", cmd_blacklist))
+    return app
 
-    logger.info("🚀 CD2 Bot 已启动，正在轮询消息...")
-    # python-telegram-bot 的 run_polling 默认在遇到网络错误时会自动重试
-    # 通过 error_handler 捕获并记录异常，无需额外配置重试参数
-    app.run_polling(
-        drop_pending_updates=True,
-        allowed_updates=Update.ALL_TYPES,
-    )
+
+def run_bot(application, health: PollingHealth | None = None) -> None:
+    health = health if health is not None else _application_polling_health(application)
+    logger.info("🚀 CD2 Bot %s 已启动，正在轮询消息...", __version__)
+    try:
+        # 自动自愈启动要保留服务端积压更新；不手工 stop/start Updater，也不增加探测请求。
+        application.run_polling(drop_pending_updates=False, allowed_updates=Update.ALL_TYPES)
+    finally:
+        if health is not None and health.fatal_reason is not None:
+            if health.exit_timer is not None:
+                health.exit_timer.cancel()
+            # stop_running 本身可能正常返回 exit 0；显式非零退出兼容 Docker on-failure。
+            raise SystemExit(1)
+
+
+if __name__ == '__main__':
+    run_bot(build_application())

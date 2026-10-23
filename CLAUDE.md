@@ -51,7 +51,7 @@ All business logic resides in `main.py` (version string in `__version__`). The c
 1. **Variable Configuration**: env vars → module constants (note the renames, see Environment Variables below)
 2. **Core Cleanup Logic**: `get_blacklist()`, `get_all_items_recursive()`, `is_directory_empty()`, `clean_task_folder()`, `run_auto_clean()`
 3. **Telegram Handlers**: `error_handler()`, `_get_polling_task()`, `watchdog_check()`, `_mask_link()`, `_extract_links()`, `_shorten()`, `_grpc_error_raw()`, `_is_transport_failure()`, `_classify_reject_reason()`, `_friendly_reject_reason()`, `_describe_submit_failure()`, `_safe_send()`, `SubmitOutcome`, `_submit_offline_link()`, `_build_batch_report()`, `_reply_single_link()`, `_submit_batch_links()`, `handle_link()`, `cmd_clean()`, `cmd_blacklist()`, `post_init()`
-4. **Entry Point** (`__main__`): ordinary API requests use `ResilientHTTPXRequest`; getUpdates keeps a separate `HTTPXRequest`. `ApplicationBuilder` wires both clients and `run_polling()` manages their lifecycle.
+4. **Entry Point** (`__main__`): ordinary API requests use `ResilientHTTPXRequest`; getUpdates uses a separate `PollingHTTPXRequest`. `MonitoredExtBot` records real API success, while `ApplicationBuilder` wires the bot and `run_polling()` manages its lifecycle.
 
 ### Key Components
 
@@ -123,6 +123,31 @@ Never call `AddOfflineFiles` again while recovering Telegram delivery.
 request lifecycle locking, confirmed-unsent notification delivery, unknown outcomes, limit and
 TTL handling, cancellation, permanent errors, rate limits and batch-report behavior. These tests
 are isolated verification, not proof of a live production deployment.
+
+### Polling Progress and Recovery (v1.1.11-2)
+
+The getUpdates client recovers its own connection pool after 3 consecutive transport failures,
+with a 60-second cooldown and at most 3 rebuilds without an intervening API success. Only a real
+successful getUpdates API response resets progress and the recovery budget; an empty update list
+is healthy. Do not stop/restart the Updater to repair the client: keep the existing offset and
+avoid bootstrap/cleanup calls that could consume or discard updates.
+
+`POLLING_STALL_SECONDS` defaults to 300 and must be positive. The built-in JobQueue watchdog
+checks every `WATCHDOG_INTERVAL_SECONDS` (default 60); setting its interval to 0 disables both
+task-death and stalled-progress checks. Startup gets one stall window. Telegram RetryAfter
+honors the required wait, then leaves one full stall window plus 5 seconds for recovery. Normal shutdown must not count as a
+failure. An unrecoverable stall requests application shutdown; allow at most 15 seconds and
+guarantee exit code 1 so Docker on-failure also restarts the process.
+
+Start with `drop_pending_updates=False` to keep Telegram's pending updates. This does not
+guarantee lossless restart: already fetched but unprocessed updates and the in-memory pending
+reply queue are not durable. Never replay CD2 submissions during notification recovery.
+
+Record message entry, handler stage/duration, rate-limited permission denials, timeouts and
+pool recovery without logging credentials or full message bodies. With the watchdog enabled, every 5 minutes record a
+polling summary with last successful API age, received counts and application queue backlog.
+APScheduler routine INFO records are suppressed by setting its logger to WARNING; job errors
+remain visible. None of these local changes establishes the unique live production root cause.
 
 ### User-Facing Rejection Messages (v1.1.9+, extended in v1.1.10)
 Technical CD2 errors reach the user through **two independent paths** — both must be
@@ -213,11 +238,13 @@ A single message may carry **several links of mixed schemes** (magnet / ed2k / h
 ### Telegram Bot v22+ Proxy Configuration
 Both `request` and `get_updates_request` must be configured with proxy:
 ```python
-from telegram.request import HTTPXRequest
+polling_health = PollingHealth()
 q_request = ResilientHTTPXRequest(proxy=PROXY_URL, connection_pool_size=8, ...)
-u_request = HTTPXRequest(proxy=PROXY_URL, ...)  # Required for getUpdates
+u_request = PollingHTTPXRequest(proxy=PROXY_URL, polling_health=polling_health, ...)
+bot = MonitoredExtBot(token=TG_BOT_TOKEN, request=q_request,
+                      get_updates_request=u_request, polling_health=polling_health)
 
-builder = ApplicationBuilder().token(TG_BOT_TOKEN).request(q_request).get_updates_request(u_request)
+builder = ApplicationBuilder().bot(bot)
 ```
 
 ### Scheduled Tasks
@@ -262,12 +289,13 @@ all_dirs.sort(key=lambda x: x.fullPathName.count('/'), reverse=True)
 | CLEAN_CRON | No | 30 3 * * * | Cleanup cron expression |
 | NETWORK_ERROR_RESET_SECONDS | No | 300 | Silence window before network-error counting restarts (log only) |
 | WATCHDOG_INTERVAL_SECONDS | No | 60 | Polling watchdog check interval in seconds (0 disables it) |
+| POLLING_STALL_SECONDS | No | 300 | Positive maximum age in seconds of successful getUpdates progress; enforced by watchdog |
 
 **Gotcha — env var name ≠ internal constant name.** When grepping `main.py`, the Python constant differs from the Docker env var:
 - `CD2_ADDRESS` → `CD2_IP_PORT`
 - `TG_TOKEN` → `TG_BOT_TOKEN`
 - `SIZE_THRESHOLD` → `SIZE_THRESHOLD_MB`
-- `NETWORK_ERROR_RESET_SECONDS` / `WATCHDOG_INTERVAL_SECONDS` keep the same name as the env var
+- `NETWORK_ERROR_RESET_SECONDS` / `WATCHDOG_INTERVAL_SECONDS` / `POLLING_STALL_SECONDS` keep the same name as the env var
 
 `SIZE_THRESHOLD` is interpreted in **MB** and converted to bytes (`SIZE_THRESHOLD_MB * 1024 * 1024`) inside `clean_task_folder()`.
 
@@ -277,7 +305,7 @@ all_dirs.sort(key=lambda x: x.fullPathName.count('/'), reverse=True)
 
 2. **Scheduled Tasks**: Never use standalone `AsyncIOScheduler` - it causes event loop conflicts with gRPC/Telegram. Use the built-in `JobQueue` instead (the scheduler is registered in `post_init()`). Note: `AsyncIOScheduler` is still imported at the top of `main.py` but is intentionally **unused** — do not wire it up. The polling watchdog (`watchdog_check`) is also registered there via `job_queue.run_repeating`.
 
-2b. **Polling Watchdog**: PTB maps HTTP 401/404 to `InvalidToken` and its `network_retry_loop` re-raises it without calling `on_err_cb`, so the polling task dies silently while the process keeps running. `watchdog_check` polls `updater._Updater__polling_task` (a private attribute, guarded with `getattr`) and calls `application.stop_running()` when it finds the task already done. Only treat it as a failure when `application.running` is still true, otherwise normal shutdowns would be misreported. This path exits with code 1, which is fine for `always` / `unless-stopped` / `on-failure` restart policies.
+2b. **Polling Watchdog**: PTB maps HTTP 401/404 to `InvalidToken` and its `network_retry_loop` re-raises it without calling `on_err_cb`; repeated `TimedOut` can also remain inside the retry loop without an error callback. Check both polling-task death and elapsed time since a real successful getUpdates API response. The private task attribute is guarded with `getattr`; progress detection must still work when that attribute is unavailable. Only report failures while the application is running, with startup/rate-limit grace and bounded exit code 1. See Polling Progress and Recovery above.
 
 3. **gRPC Timeout**: All gRPC calls must have timeout (15-30s) to prevent hanging when CD2 mount points are stuck.
 

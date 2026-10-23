@@ -27,5 +27,6 @@ services:
       - SIZE_THRESHOLD=300                  # 可选，默认 300；小于该体积(MB)的文件会被清理删除
       - CLEAN_CRON=30 3 * * *               # 可选，默认 30 3 * * *（每天 03:30）；定时清理的 Cron 表达式
       - WATCHDOG_INTERVAL_SECONDS=60        # 可选，默认 60；轮询看门狗检查周期(秒)，设为 0 关闭看门狗
+      - POLLING_STALL_SECONDS=300           # 可选，默认 300；连续多久没有成功拉取消息视为停滞(秒)，须大于 0
       - NETWORK_ERROR_RESET_SECONDS=300     # 可选，默认 300；网络异常静默多久后重新计数(秒)，仅用于日志诊断
       - PROXY_URL=                          # 可选，默认留空=直连；访问 Telegram 的代理，支持 http/socks5
